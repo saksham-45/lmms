@@ -11,6 +11,7 @@
 #include "Track.h"
 #include "ToolPlugin.h"
 
+class QObject;
 class QWidget;
 
 namespace lmms
@@ -24,17 +25,12 @@ namespace gui
 class AgentControlView;
 }
 
-class AgentControlPlugin : public ToolPlugin
+class AgentControlService : public QObject
 {
 	Q_OBJECT
 public:
-	AgentControlPlugin();
-	~AgentControlPlugin() override;
-
-	QString nodeName() const override;
-	void saveSettings(QDomDocument&, QDomElement&) override;
-	void loadSettings(const QDomElement&) override;
-	gui::PluginView* instantiateView(QWidget*) override;
+	static AgentControlService* instance();
+	~AgentControlService() override;
 
 	QString handleCommand(const QString& text);
 	QString handleJson(const QJsonObject& obj);
@@ -49,6 +45,8 @@ private slots:
 	void onSocketClosed();
 
 private:
+	AgentControlService();
+
 	QString dispatchTokens(const QStringList& tokens, const QString& rawText);
 
 	bool importFromDownloads(const QString& fileName, QString& error);
@@ -82,6 +80,28 @@ private:
 
 	QTcpServer m_server;
 	QSet<QTcpSocket*> m_clients;
+};
+
+class AgentControlPlugin : public ToolPlugin
+{
+	Q_OBJECT
+public:
+	AgentControlPlugin();
+	~AgentControlPlugin() override;
+
+	static AgentControlService* service();
+
+	QString nodeName() const override;
+	void saveSettings(QDomDocument&, QDomElement&) override;
+	void loadSettings(const QDomElement&) override;
+	gui::PluginView* instantiateView(QWidget*) override;
+
+	QString handleCommand(const QString& text);
+	QString handleJson(const QJsonObject& obj);
+
+signals:
+	void logMessage(const QString& msg);
+	void commandResult(const QString& msg);
 };
 
 } // namespace lmms

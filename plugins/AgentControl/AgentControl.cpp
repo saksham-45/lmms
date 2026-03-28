@@ -1,6 +1,7 @@
 #include "AgentControl.h"
 
 #include <QDir>
+#include <QCoreApplication>
 #include <QFile>
 #include <QFileInfo>
 #include <QHostAddress>
@@ -54,10 +55,23 @@ PLUGIN_EXPORT Plugin * lmms_plugin_main( Model *, void * )
 }
 }
 
-AgentControlPlugin::AgentControlPlugin() :
-	ToolPlugin( &AgentControl_plugin_descriptor, nullptr )
+AgentControlService* AgentControlService::instance()
 {
-	connect( &m_server, &QTcpServer::newConnection, this, &AgentControlPlugin::onNewConnection );
+	static AgentControlService* service = nullptr;
+	if( service == nullptr )
+	{
+		service = new AgentControlService;
+		if( auto *app = QCoreApplication::instance() )
+		{
+			service->setParent( app );
+		}
+	}
+	return service;
+}
+
+AgentControlService::AgentControlService()
+{
+	connect( &m_server, &QTcpServer::newConnection, this, &AgentControlService::onNewConnection );
 
 	if( !m_server.listen( QHostAddress::LocalHost, 7777 ) )
 	{
@@ -69,7 +83,7 @@ AgentControlPlugin::AgentControlPlugin() :
 	}
 }
 
-AgentControlPlugin::~AgentControlPlugin()
+AgentControlService::~AgentControlService()
 {
 	for( auto *client : m_clients )
 	{
@@ -82,6 +96,21 @@ AgentControlPlugin::~AgentControlPlugin()
 	}
 	m_clients.clear();
 	m_server.close();
+}
+
+AgentControlPlugin::AgentControlPlugin() :
+	ToolPlugin( &AgentControl_plugin_descriptor, nullptr )
+{
+	auto *svc = service();
+	connect( svc, &AgentControlService::logMessage, this, &AgentControlPlugin::logMessage );
+	connect( svc, &AgentControlService::commandResult, this, &AgentControlPlugin::commandResult );
+}
+
+AgentControlPlugin::~AgentControlPlugin() = default;
+
+AgentControlService* AgentControlPlugin::service()
+{
+	return AgentControlService::instance();
 }
 
 QString AgentControlPlugin::nodeName() const
@@ -104,6 +133,16 @@ gui::PluginView* AgentControlPlugin::instantiateView( QWidget* )
 
 QString AgentControlPlugin::handleCommand( const QString& rawText )
 {
+	return service()->handleCommand( rawText );
+}
+
+QString AgentControlPlugin::handleJson( const QJsonObject& obj )
+{
+	return service()->handleJson( obj );
+}
+
+QString AgentControlService::handleCommand( const QString& rawText )
+{
 	const QString trimmed = rawText.trimmed();
 	if( trimmed.isEmpty() )
 	{
@@ -114,7 +153,7 @@ QString AgentControlPlugin::handleCommand( const QString& rawText )
 	return dispatchTokens( parts, trimmed );
 }
 
-QString AgentControlPlugin::handleJson( const QJsonObject& obj )
+QString AgentControlService::handleJson( const QJsonObject& obj )
 {
 	QStringList tokens;
 	const QString command = obj.value( "command" ).toString().trimmed();
@@ -152,7 +191,7 @@ QString AgentControlPlugin::handleJson( const QJsonObject& obj )
 	return dispatchTokens( tokens, command );
 }
 
-QString AgentControlPlugin::dispatchTokens( const QStringList& tokens, const QString& rawText )
+QString AgentControlService::dispatchTokens( const QStringList& tokens, const QString& rawText )
 {
 	QString result;
 	QString error;
@@ -289,19 +328,19 @@ QString AgentControlPlugin::dispatchTokens( const QStringList& tokens, const QSt
 	return tr( "Unknown command: %1" ).arg( rawText );
 }
 
-void AgentControlPlugin::onNewConnection()
+void AgentControlService::onNewConnection()
 {
 	while( m_server.hasPendingConnections() )
 	{
 		QTcpSocket *sock = m_server.nextPendingConnection();
 		m_clients.insert( sock );
-		connect( sock, &QTcpSocket::readyRead, this, &AgentControlPlugin::onSocketReady );
-		connect( sock, &QTcpSocket::disconnected, this, &AgentControlPlugin::onSocketClosed );
+		connect( sock, &QTcpSocket::readyRead, this, &AgentControlService::onSocketReady );
+		connect( sock, &QTcpSocket::disconnected, this, &AgentControlService::onSocketClosed );
 		emit logMessage( tr( "Client connected" ) );
 	}
 }
 
-void AgentControlPlugin::onSocketReady()
+void AgentControlService::onSocketReady()
 {
 	auto *sock = qobject_cast<QTcpSocket *>( sender() );
 	if( !sock )
@@ -330,7 +369,7 @@ void AgentControlPlugin::onSocketReady()
 	}
 }
 
-void AgentControlPlugin::onSocketClosed()
+void AgentControlService::onSocketClosed()
 {
 	auto *sock = qobject_cast<QTcpSocket *>( sender() );
 	if( !sock )
@@ -342,7 +381,7 @@ void AgentControlPlugin::onSocketClosed()
 	emit logMessage( tr( "Client disconnected" ) );
 }
 
-bool AgentControlPlugin::newProject( QString& result, QString& error )
+bool AgentControlService::newProject( QString& result, QString& error )
 {
 	Song *song = Engine::getSong();
 	auto *guiApp = gui::getGUI();
@@ -359,7 +398,7 @@ bool AgentControlPlugin::newProject( QString& result, QString& error )
 	return true;
 }
 
-bool AgentControlPlugin::openProject( const QString& path, QString& result, QString& error )
+bool AgentControlService::openProject( const QString& path, QString& result, QString& error )
 {
 	const QString fullPath = canonicalPath( path );
 	if( fullPath.isEmpty() )
@@ -382,7 +421,7 @@ bool AgentControlPlugin::openProject( const QString& path, QString& result, QStr
 	return true;
 }
 
-bool AgentControlPlugin::saveProject( QString& result, QString& error )
+bool AgentControlService::saveProject( QString& result, QString& error )
 {
 	Song *song = Engine::getSong();
 	if( song == nullptr )
@@ -404,7 +443,7 @@ bool AgentControlPlugin::saveProject( QString& result, QString& error )
 	return true;
 }
 
-bool AgentControlPlugin::saveProjectAs( const QString& path, QString& result, QString& error )
+bool AgentControlService::saveProjectAs( const QString& path, QString& result, QString& error )
 {
 	Song *song = Engine::getSong();
 	if( song == nullptr )
@@ -424,7 +463,7 @@ bool AgentControlPlugin::saveProjectAs( const QString& path, QString& result, QS
 	return true;
 }
 
-bool AgentControlPlugin::showWindowCommand( const QString& windowName, QString& result, QString& error )
+bool AgentControlService::showWindowCommand( const QString& windowName, QString& result, QString& error )
 {
 	auto *guiApp = gui::getGUI();
 	if( guiApp == nullptr || guiApp->mainWindow() == nullptr )
@@ -493,7 +532,7 @@ bool AgentControlPlugin::showWindowCommand( const QString& windowName, QString& 
 	return true;
 }
 
-bool AgentControlPlugin::showToolCommand( const QString& toolName, QString& result, QString& error )
+bool AgentControlService::showToolCommand( const QString& toolName, QString& result, QString& error )
 {
 	const QString desired = normalizeName( toolName );
 	for( const Plugin::Descriptor* desc : getPluginFactory()->descriptors( Plugin::Type::Tool ) )
@@ -532,7 +571,7 @@ bool AgentControlPlugin::showToolCommand( const QString& toolName, QString& resu
 	return false;
 }
 
-bool AgentControlPlugin::createTrack( Track::Type type, QString& result, QString& error )
+bool AgentControlService::createTrack( Track::Type type, QString& result, QString& error )
 {
 	Song *song = Engine::getSong();
 	if( song == nullptr )
@@ -552,7 +591,7 @@ bool AgentControlPlugin::createTrack( Track::Type type, QString& result, QString
 	return true;
 }
 
-bool AgentControlPlugin::createInstrumentTrack( const QString& pluginName, QString& result, QString& error )
+bool AgentControlService::createInstrumentTrack( const QString& pluginName, QString& result, QString& error )
 {
 	Song *song = Engine::getSong();
 	auto *guiApp = gui::getGUI();
@@ -594,12 +633,12 @@ bool AgentControlPlugin::createInstrumentTrack( const QString& pluginName, QStri
 	return true;
 }
 
-bool AgentControlPlugin::importFromDownloads( const QString& fileName, QString& error )
+bool AgentControlService::importFromDownloads( const QString& fileName, QString& error )
 {
 	return importAudioFile( resolveDownloadsFile( fileName ), error );
 }
 
-bool AgentControlPlugin::importAudioFile( const QString& path, QString& error )
+bool AgentControlService::importAudioFile( const QString& path, QString& error )
 {
 	const QString fullPath = canonicalPath( path );
 	if( fullPath.isEmpty() )
@@ -627,7 +666,7 @@ bool AgentControlPlugin::importAudioFile( const QString& path, QString& error )
 	return true;
 }
 
-bool AgentControlPlugin::importProjectFile( const QString& path, QString& error )
+bool AgentControlService::importProjectFile( const QString& path, QString& error )
 {
 	const QString fullPath = canonicalPath( path );
 	if( fullPath.isEmpty() )
@@ -645,7 +684,7 @@ bool AgentControlPlugin::importProjectFile( const QString& path, QString& error 
 	return true;
 }
 
-bool AgentControlPlugin::addKickPattern( QString& error )
+bool AgentControlService::addKickPattern( QString& error )
 {
 	const QString samplePath = defaultKickSample();
 	if( samplePath.isEmpty() )
@@ -670,7 +709,7 @@ bool AgentControlPlugin::addKickPattern( QString& error )
 	return true;
 }
 
-bool AgentControlPlugin::addEffectToTrack( const QString& effectName, const QString& trackName, QString& result, QString& error )
+bool AgentControlService::addEffectToTrack( const QString& effectName, const QString& trackName, QString& result, QString& error )
 {
 	Track *track = trackName.isEmpty()
 		? findLastTrackOfTypes( { Track::Type::Instrument, Track::Type::Sample } )
@@ -738,7 +777,7 @@ bool AgentControlPlugin::addEffectToTrack( const QString& effectName, const QStr
 	return true;
 }
 
-bool AgentControlPlugin::removeEffectFromTrack( const QString& effectName, const QString& trackName, QString& result, QString& error )
+bool AgentControlService::removeEffectFromTrack( const QString& effectName, const QString& trackName, QString& result, QString& error )
 {
 	Track *track = trackName.isEmpty()
 		? findLastTrackOfTypes( { Track::Type::Instrument, Track::Type::Sample } )
@@ -775,7 +814,7 @@ bool AgentControlPlugin::removeEffectFromTrack( const QString& effectName, const
 	return false;
 }
 
-Track* AgentControlPlugin::findTrackByName( const QString& trackName ) const
+Track* AgentControlService::findTrackByName( const QString& trackName ) const
 {
 	Song *song = Engine::getSong();
 	if( song == nullptr )
@@ -795,7 +834,7 @@ Track* AgentControlPlugin::findTrackByName( const QString& trackName ) const
 	return nullptr;
 }
 
-Track* AgentControlPlugin::findLastTrackOfTypes( const QList<Track::Type>& types ) const
+Track* AgentControlService::findLastTrackOfTypes( const QList<Track::Type>& types ) const
 {
 	Song *song = Engine::getSong();
 	if( song == nullptr )
@@ -814,12 +853,12 @@ Track* AgentControlPlugin::findLastTrackOfTypes( const QList<Track::Type>& types
 	return nullptr;
 }
 
-InstrumentTrack* AgentControlPlugin::findInstrumentTrack( const QString& trackName ) const
+InstrumentTrack* AgentControlService::findInstrumentTrack( const QString& trackName ) const
 {
 	return dynamic_cast<InstrumentTrack *>( findTrackByName( trackName ) );
 }
 
-SampleTrack* AgentControlPlugin::createSampleTrack( const QString& name ) const
+SampleTrack* AgentControlService::createSampleTrack( const QString& name ) const
 {
 	Song *song = Engine::getSong();
 	if( song == nullptr )
@@ -834,7 +873,7 @@ SampleTrack* AgentControlPlugin::createSampleTrack( const QString& name ) const
 	return track;
 }
 
-EffectChain* AgentControlPlugin::effectChainForTrack( Track* track ) const
+EffectChain* AgentControlService::effectChainForTrack( Track* track ) const
 {
 	if( auto *instrumentTrack = dynamic_cast<InstrumentTrack *>( track ) )
 	{
@@ -847,7 +886,7 @@ EffectChain* AgentControlPlugin::effectChainForTrack( Track* track ) const
 	return nullptr;
 }
 
-bool AgentControlPlugin::addSampleClip( SampleTrack *track, const QString& samplePath, int tickPos )
+bool AgentControlService::addSampleClip( SampleTrack *track, const QString& samplePath, int tickPos )
 {
 	auto *clip = dynamic_cast<SampleClip *>( track->createClip( TimePos( tickPos ) ) );
 	if( clip == nullptr )
@@ -860,7 +899,7 @@ bool AgentControlPlugin::addSampleClip( SampleTrack *track, const QString& sampl
 	return true;
 }
 
-QString AgentControlPlugin::resolveDownloadsFile( const QString& fileName ) const
+QString AgentControlService::resolveDownloadsFile( const QString& fileName ) const
 {
 	if( fileName.isEmpty() )
 	{
@@ -876,14 +915,14 @@ QString AgentControlPlugin::resolveDownloadsFile( const QString& fileName ) cons
 	return QFile::exists( absPath ) ? absPath : QString{};
 }
 
-QString AgentControlPlugin::defaultKickSample() const
+QString AgentControlService::defaultKickSample() const
 {
 	const QString base = ConfigManager::inst()->factorySamplesDir();
 	const QString candidate = QDir( base ).filePath( "drums/bassdrum04.ogg" );
 	return QFile::exists( candidate ) ? candidate : QString{};
 }
 
-QString AgentControlPlugin::canonicalPath( const QString& path ) const
+QString AgentControlService::canonicalPath( const QString& path ) const
 {
 	if( path.isEmpty() )
 	{
@@ -911,12 +950,12 @@ QString AgentControlPlugin::canonicalPath( const QString& path ) const
 	return {};
 }
 
-QString AgentControlPlugin::joinTokens( const QStringList& tokens, int startIndex ) const
+QString AgentControlService::joinTokens( const QStringList& tokens, int startIndex ) const
 {
 	return startIndex < tokens.size() ? tokens.mid( startIndex ).join( " " ).trimmed() : QString{};
 }
 
-QString AgentControlPlugin::normalizeName( const QString& text ) const
+QString AgentControlService::normalizeName( const QString& text ) const
 {
 	QString out;
 	out.reserve( text.size() );
