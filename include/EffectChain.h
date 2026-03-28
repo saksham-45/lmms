@@ -64,6 +64,7 @@ public:
 	void moveDown( Effect * _effect );
 	void moveUp( Effect * _effect );
 	bool processAudioBuffer(AudioBuffer& buffer);
+	const std::vector<Effect*>& effects() const { return m_effects; }
 
 	void clear();
 

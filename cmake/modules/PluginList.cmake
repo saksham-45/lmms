@@ -78,6 +78,7 @@ SET(LMMS_PLUGIN_LIST
 	Vibed
 	Xpressive
 	ZynAddSubFx
+	AgentControl
 )
 
 IF("${PLUGIN_LIST}" STREQUAL "")
