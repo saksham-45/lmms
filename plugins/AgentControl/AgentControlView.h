@@ -5,6 +5,7 @@
 #include <QLineEdit>
 #include <QLabel>
 #include <QPushButton>
+#include <QProcess>
 
 #include "ToolPluginView.h"
 
@@ -24,12 +25,26 @@ public:
 private slots:
 	void runCommand();
 	void appendLog( const QString &text );
+	void startVoiceCapture();
+	void stopVoiceCapture();
+	void voiceProcessError( QProcess::ProcessError error );
 
 private:
+	void setVoiceUiState( bool recording );
+	QString ffmpegPath() const;
+	QString whisperPath() const;
+	QString microphoneDevice() const;
+	QStringList ffmpegCaptureArgs( const QString &outputPath ) const;
+	bool runWhisperAndDispatch( const QString &audioPath );
+
 	AgentControlPlugin *m_plugin;
 	QLineEdit *m_input;
 	QTextEdit *m_log;
 	QLabel *m_status;
+	QPushButton *m_voiceStartButton;
+	QPushButton *m_voiceStopButton;
+	QProcess *m_voiceRecordProcess;
+	QString m_voiceAudioPath;
 };
 
 } // namespace gui
