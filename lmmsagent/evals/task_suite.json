@@ -1,0 +1,31 @@
+{
+  "version": "v1",
+  "buckets": {
+    "atomic": [
+      "set tempo to 120",
+      "show mixer",
+      "add effect reverb",
+      "import /tmp/loop.wav"
+    ],
+    "compositional": [
+      "create sample track and load sample /tmp/kick.wav",
+      "load instrument triple oscillator and add effect compressor",
+      "import audio /tmp/vocal.wav and open slicer",
+      "create instrument track and rename track to Bass Layer"
+    ],
+    "creative_constrained": [
+      "make this bass darker",
+      "add texture to intro",
+      "make drums hit harder"
+    ]
+  },
+  "metrics": [
+    "task_success_rate",
+    "discovery_resolution_accuracy",
+    "clarification_precision",
+    "repair_success_after_failure",
+    "rollback_correctness",
+    "median_latency_ms",
+    "p95_latency_ms"
+  ]
+}

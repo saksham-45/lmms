@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentControlToolResponse",
+  "type": "object",
+  "required": [
+    "ok",
+    "result",
+    "state_delta",
+    "warnings",
+    "error_code",
+    "error_message"
+  ],
+  "properties": {
+    "ok": {"type": "boolean"},
+    "result": {"type": "object"},
+    "state_delta": {"type": "object"},
+    "warnings": {"type": "array"},
+    "error_code": {"type": ["string", "null"]},
+    "error_message": {"type": ["string", "null"]}
+  },
+  "additionalProperties": true
+}
