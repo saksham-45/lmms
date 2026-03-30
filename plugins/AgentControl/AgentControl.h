@@ -64,8 +64,31 @@ private:
 	bool isUnknownResponse(const QString& response) const;
 	bool isFamiliarIntentText(const QString& rawText) const;
 	bool applyHeuristicMappings(const QString& rawText, QString& mappedCommand, QString& reason) const;
-	bool resolveWithOllama(const QString& rawText, QString& mappedCommand, double& confidence, QString& error) const;
+	bool resolveWithOllama(
+		const QString& rawText,
+		QString& mappedCommand,
+		QString& intent,
+		QJsonObject& arguments,
+		QString& riskLevel,
+		double& confidence,
+		QString& reason,
+		QString& error ) const;
 	bool maybeRunTextAgentFallback(const QString& rawText, QString& result, QString& error);
+	QString inferIntentForCommand(const QString& commandText) const;
+	QString normalizedRiskForIntent(const QString& intent) const;
+	bool isIntentEnabled(const QString& intent) const;
+	bool commandNeedsConfirmation(
+		const QString& intent,
+		const QString& commandText,
+		const QString& riskHint = QString() ) const;
+	bool isConfirmationUtterance(const QString& rawText) const;
+	QString executeWithSafetyGate(
+		const QString& commandText,
+		const QString& source,
+		double confidence,
+		const QString& reason,
+		const QString& riskHint = QString() );
+	void emitTrace(const QString& stage, const QJsonObject& payload = QJsonObject());
 
 	QString dispatchTokens(const QStringList& tokens, const QString& rawText);
 	QJsonObject dispatchTool(const QString& toolName, const QJsonObject& args);
@@ -112,6 +135,9 @@ private:
 	bool importProjectFile(const QString& path, QString& error);
 	bool addKickPattern(QString& error);
 	bool addSnarePattern(QString& error);
+	bool addHiHatPattern(QString& error);
+	bool addCrashPattern(QString& error);
+	bool addRidePattern(QString& error);
 
 	bool createTrack(Track::Type type, QString& result, QString& error);
 	bool createInstrumentTrack(const QString& pluginName, QString& result, QString& error);
@@ -125,6 +151,8 @@ private:
 	bool showToolCommand(const QString& toolName, QString& result, QString& error);
 	bool newProject(QString& result, QString& error);
 	bool openProject(const QString& path, QString& result, QString& error);
+	void scheduleDeferredOpenProject(const QString& fullPath);
+	void processDeferredOpenProject();
 	bool saveProject(QString& result, QString& error);
 	bool saveProjectAs(const QString& path, QString& result, QString& error);
 	bool addEffectToTrack(const QString& effectName, const QString& trackName, QString& result, QString& error);
@@ -143,6 +171,9 @@ private:
 	QString resolveDownloadsAudioQuery(const QString& query) const;
 	QString defaultKickSample() const;
 	QString defaultSnareSample() const;
+	QString defaultHiHatSample() const;
+	QString defaultCrashSample() const;
+	QString defaultRideSample() const;
 	QString canonicalPath(const QString& path) const;
 	QString joinTokens(const QStringList& tokens, int startIndex) const;
 	QString normalizeName(const QString& text) const;
@@ -154,9 +185,14 @@ private:
 	int m_snapshotCounter = 0;
 	int m_actionCounter = 0;
 	bool m_projectTransitionQueued = false;
+	QString m_deferredOpenProjectPath;
+	int m_deferredOpenProjectRetries = 0;
 	QString m_selectedTrackName;
 	QString m_lastImportedAudioPath;
 	QString m_lastLoadedInstrument;
+	QString m_pendingConfirmationCommand;
+	QString m_pendingConfirmationIntent;
+	qint64 m_pendingConfirmationExpiresMs = 0;
 };
 
 class AgentControlPlugin : public ToolPlugin

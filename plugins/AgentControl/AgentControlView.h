@@ -6,6 +6,8 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QProcess>
+#include <QJsonObject>
+#include <QHash>
 #include <QSet>
 #include <QTimer>
 
@@ -50,10 +52,27 @@ private:
 	QString microphoneDevice() const;
 	QStringList ffmpegCaptureArgs( const QString &outputPath ) const;
 	QStringList ffmpegContinuousCaptureArgs( const QString &outputPattern ) const;
+	QString normalizeTranscriptForCommand( const QString& transcript ) const;
 	bool looksLikeCommandTranscript( const QString& transcript ) const;
 	bool canonicalizeFastCommand( const QString& transcript, QString& command ) const;
+	bool wakePhraseRequired() const;
+	QStringList wakePhrases() const;
+	bool extractWakeCommand( const QString& transcript, QString& commandRemainder, bool& wakeDetected ) const;
+	QStringList splitCommandChain( const QString& transcript ) const;
+	QString applyContextHints( const QString& commandText ) const;
+	void updateVoiceContextFromCommand( const QString& commandText );
+	bool isLikelySilentWav( const QString& audioPath, double* meanAbs = nullptr ) const;
+	void appendTrace( const QString& stage, const QJsonObject& payload = QJsonObject() ) const;
 	bool dispatchTranscript( const QString& transcript );
 	bool runWhisperAndDispatch( const QString &audioPath );
+
+	enum class VoiceChunkStatus
+	{
+		Seen = 0,
+		Processing,
+		Done,
+		Error
+	};
 
 	AgentControlPlugin *m_plugin;
 	QLineEdit *m_input;
@@ -66,11 +85,20 @@ private:
 	QTimer *m_voiceChunkTimer;
 	QString m_voiceAudioPath;
 	QString m_voiceChunkDir;
-	QSet<QString> m_processedVoiceChunks;
+	QHash<QString, VoiceChunkStatus> m_voiceChunkStates;
 	QString m_lastDispatchedTranscript;
 	QString m_pendingTranscript;
+	QString m_lastContextPlugin;
+	QString m_lastContextTrack;
+	QString m_lastContextImportedFile;
+	QString m_lastContextWindow;
 	qint64 m_lastDispatchedAtMs = 0;
+	qint64 m_wakeWindowUntilMs = 0;
 	bool m_whisperServiceReady = false;
+	bool m_processingVoiceChunks = false;
+	bool m_reprocessVoiceChunks = false;
+	int m_whisperServiceFailureCount = 0;
+	qint64 m_whisperServiceCooldownUntilMs = 0;
 };
 
 } // namespace gui

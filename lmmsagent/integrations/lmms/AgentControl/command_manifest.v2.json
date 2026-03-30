@@ -1,0 +1,353 @@
+{
+  "version": "2.0",
+  "metadata": {
+    "description": "Canonical LMMS voice command manifest for deterministic + hybrid interpretation.",
+    "default_model": "qwen2.5:7b-instruct",
+    "runtime": "AgentControl"
+  },
+  "intents": [
+    {
+      "intent": "project.new",
+      "aliases": [
+        "new project",
+        "create project"
+      ],
+      "risk_level": "confirm",
+      "capability_flag": "PROJECT_NEW",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "always"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "project.open",
+      "aliases": [
+        "open project",
+        "load project"
+      ],
+      "risk_level": "confirm",
+      "capability_flag": "PROJECT_OPEN",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "always"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "project.save",
+      "aliases": [
+        "save project",
+        "save current project"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "PROJECT_SAVE",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "project.export",
+      "aliases": [
+        "export song",
+        "render song",
+        "export tracks"
+      ],
+      "risk_level": "confirm",
+      "capability_flag": "PROJECT_EXPORT",
+      "side_effect_level": "export",
+      "confirmation_policy": {
+        "mode": "always"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "window.open",
+      "aliases": [
+        "open song editor",
+        "open piano roll",
+        "open automation editor",
+        "open mixer",
+        "open pattern editor",
+        "open controller rack",
+        "open project notes"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "WINDOW_OPEN",
+      "side_effect_level": "ui",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "transport.play",
+      "aliases": [
+        "play",
+        "start playback",
+        "resume playback"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "TRANSPORT_PLAY",
+      "side_effect_level": "ui",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "transport.pause",
+      "aliases": [
+        "pause",
+        "pause playback"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "TRANSPORT_PAUSE",
+      "side_effect_level": "ui",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "transport.stop",
+      "aliases": [
+        "stop",
+        "stop playback"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "TRANSPORT_STOP",
+      "side_effect_level": "ui",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "track.create",
+      "aliases": [
+        "create instrument track",
+        "create sample track",
+        "create automation track",
+        "create pattern track",
+        "create arpeggiator lane",
+        "new arpeggiator lane"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "TRACK_CREATE",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "track.state",
+      "aliases": [
+        "mute track",
+        "unmute track",
+        "solo track",
+        "unsolo track"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "TRACK_STATE",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "instrument.load",
+      "aliases": [
+        "load instrument",
+        "add piano",
+        "new instrument"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "INSTRUMENT_LOAD",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "slicer.open",
+      "aliases": [
+        "open slicer",
+        "show slicer",
+        "open splicer"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "SLICER_OPEN",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "slicer.import",
+      "aliases": [
+        "import sample into slicer",
+        "load sample into slicer",
+        "import from downloads into slicer"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "SLICER_IMPORT",
+      "side_effect_level": "mutate",
+      "requires_context": [
+        "last_plugin",
+        "last_imported_file"
+      ],
+      "slot_rules": {
+        "audio_file": {
+          "required": true,
+          "sources": [
+            "absolute_path",
+            "downloads_fuzzy",
+            "recent_context"
+          ]
+        }
+      },
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "slicer.split.equal",
+      "aliases": [
+        "divide into equal segments",
+        "split into equal segments",
+        "split into 16 segments"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "SLICER_SPLIT_EQUAL",
+      "side_effect_level": "mutate",
+      "requires_context": [
+        "last_plugin"
+      ],
+      "slot_rules": {
+        "segments": {
+          "required": false,
+          "default": 16,
+          "min": 1,
+          "max": 128
+        }
+      },
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "slicer.split.transient",
+      "aliases": [
+        "divide into transient segments",
+        "split by transients"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "SLICER_SPLIT_TRANSIENT",
+      "side_effect_level": "mutate",
+      "requires_context": [
+        "last_plugin"
+      ],
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "tempo.set",
+      "aliases": [
+        "set tempo",
+        "set bpm",
+        "raise tempo",
+        "lower tempo"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "TEMPO_SET",
+      "side_effect_level": "mutate",
+      "slot_rules": {
+        "tempo": {
+          "required": true,
+          "min": 20,
+          "max": 260
+        }
+      },
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "pattern.rhythm",
+      "aliases": [
+        "add kick drums",
+        "add snare",
+        "add 808",
+        "add hi hat",
+        "add hi-hat",
+        "add hihat",
+        "add hats",
+        "add crash",
+        "add crash cymbal",
+        "add ride",
+        "add cymbal"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "PATTERN_RHYTHM",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "mixer.effect.add",
+      "aliases": [
+        "add effect reverb",
+        "add effect"
+      ],
+      "risk_level": "safe",
+      "capability_flag": "MIXER_EFFECT_ADD",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "never"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "mixer.effect.remove",
+      "aliases": [
+        "remove effect",
+        "remove effect from track"
+      ],
+      "risk_level": "confirm",
+      "capability_flag": "MIXER_EFFECT_REMOVE",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "always"
+      },
+      "enabled_by_default": true
+    },
+    {
+      "intent": "undo",
+      "aliases": [
+        "undo",
+        "rollback"
+      ],
+      "risk_level": "confirm",
+      "capability_flag": "UNDO",
+      "side_effect_level": "mutate",
+      "confirmation_policy": {
+        "mode": "always"
+      },
+      "enabled_by_default": true
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "version": "2.0",
+  "description": "Golden scenarios for hybrid LMMS voice command interpretation and safety gating.",
+  "cases": [
+    {
+      "utterance": "hey lmms open splicer",
+      "expected_intent": "slicer.open",
+      "expected_command": "open slicer",
+      "needs_confirmation": false
+    },
+    {
+      "utterance": "hey lmms import sample.wav from downloads into slicer",
+      "expected_intent": "slicer.import",
+      "expected_command": "import sample.wav into slicer",
+      "needs_confirmation": false
+    },
+    {
+      "utterance": "hey lmms split it into 16 segments",
+      "expected_intent": "slicer.split.equal",
+      "expected_command": "divide into 16 equal segments",
+      "needs_confirmation": false
+    },
+    {
+      "utterance": "hey lmms divide into transient segments",
+      "expected_intent": "slicer.split.transient",
+      "expected_command": "divide into transient segments",
+      "needs_confirmation": false
+    },
+    {
+      "utterance": "hey lmms create instrument track and open piano roll",
+      "expected_chain": [
+        "create instrument track",
+        "open piano roll"
+      ],
+      "needs_confirmation": false
+    },
+    {
+      "utterance": "hey lmms remove effect reverb from bass",
+      "expected_intent": "mixer.effect.remove",
+      "needs_confirmation": true
+    },
+    {
+      "utterance": "ambient chatter without wake phrase open slicer",
+      "expected_outcome": "ignored_no_wake"
+    },
+    {
+      "utterance": "hey lmms raise tempo to 150",
+      "expected_intent": "tempo.set",
+      "expected_command": "set tempo to 150",
+      "needs_confirmation": false
+    },
+    {
+      "utterance": "hey lmms play",
+      "expected_intent": "transport.play",
+      "expected_command": "play",
+      "needs_confirmation": false
+    },
+    {
+      "utterance": "hey lmms stop playback",
+      "expected_intent": "transport.stop",
+      "expected_command": "stop",
+      "needs_confirmation": false
+    }
+  ]
+}

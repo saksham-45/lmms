@@ -8,6 +8,7 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QEventLoop>
+#include <QElapsedTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
@@ -20,6 +21,8 @@
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
+
+#include <cstdint>
 
 #include "AgentControl.h"
 
@@ -62,7 +65,7 @@ AgentControlView::AgentControlView( AgentControlPlugin *plugin )
 	connect( m_voiceStopButton, &QPushButton::clicked, this, &AgentControlView::stopVoiceCapture );
 	connect( m_voiceChunkTimer, &QTimer::timeout, this, &AgentControlView::processVoiceChunks );
 	const int configuredPollMs = qEnvironmentVariableIntValue( "LMMS_VOICE_POLL_MS" );
-	m_voiceChunkTimer->setInterval( configuredPollMs > 0 ? qMax( 200, configuredPollMs ) : 350 );
+	m_voiceChunkTimer->setInterval( configuredPollMs > 0 ? qMax( 150, configuredPollMs ) : 250 );
 	connect( m_plugin, &AgentControlPlugin::logMessage, this, &AgentControlView::appendLog );
 	connect( m_plugin, &AgentControlPlugin::commandResult, this, &AgentControlView::appendLog );
 	setVoiceUiState( false );
@@ -81,6 +84,12 @@ AgentControlView::AgentControlView( AgentControlPlugin *plugin )
 		appendLog( tr( "Whisper service mode enabled: %1 (model=%2)" )
 			.arg( whisperServiceBaseUrl(), whisperServiceModel() ) );
 	}
+	appendLog( tr( "Wake mode: required=%1 phrases=%2 window_ms=%3" )
+		.arg( wakePhraseRequired() ? tr( "yes" ) : tr( "no" ) )
+		.arg( wakePhrases().join( ", " ) )
+		.arg( qEnvironmentVariableIntValue( "LMMS_WAKE_WINDOW_MS" ) > 0
+			? qEnvironmentVariableIntValue( "LMMS_WAKE_WINDOW_MS" )
+			: 8000 ) );
 
 	hide();
 	if( parentWidget() )
@@ -115,6 +124,9 @@ AgentControlView::~AgentControlView()
 		chunkDir.removeRecursively();
 		m_voiceChunkDir.clear();
 	}
+	m_voiceChunkStates.clear();
+	m_processingVoiceChunks = false;
+	m_reprocessVoiceChunks = false;
 	shutdownWhisperService();
 }
 
@@ -523,6 +535,224 @@ QStringList AgentControlView::ffmpegContinuousCaptureArgs( const QString &output
 	return args;
 }
 
+QString AgentControlView::normalizeTranscriptForCommand( const QString& transcript ) const
+{
+	QString normalized = transcript.trimmed().toLower();
+	normalized.replace( QRegularExpression( R"([\u2018\u2019])" ), QStringLiteral( "'" ) );
+	normalized.replace( QRegularExpression( R"([\u201c\u201d])" ), QStringLiteral( "\"" ) );
+	normalized.replace( QRegularExpression( R"(\s+)" ), QStringLiteral( " " ) );
+	return normalized.simplified();
+}
+
+bool AgentControlView::wakePhraseRequired() const
+{
+	const QString raw = qEnvironmentVariable( "LMMS_WAKE_REQUIRED" ).trimmed().toLower();
+	if( raw.isEmpty() )
+	{
+		return true;
+	}
+	return !( raw == QStringLiteral( "0" ) ||
+		raw == QStringLiteral( "false" ) ||
+		raw == QStringLiteral( "off" ) ||
+		raw == QStringLiteral( "no" ) );
+}
+
+QStringList AgentControlView::wakePhrases() const
+{
+	const QString configured = qEnvironmentVariable( "LMMS_WAKE_PHRASES" ).trimmed();
+	QStringList phrases;
+	if( configured.isEmpty() )
+	{
+		phrases << QStringLiteral( "hey lmms" );
+		phrases << QStringLiteral( "ok lmms" );
+	}
+	else
+	{
+		phrases = configured.split( ',', Qt::SkipEmptyParts );
+		for( QString& phrase : phrases )
+		{
+			phrase = normalizeTranscriptForCommand( phrase );
+		}
+	}
+	phrases.removeDuplicates();
+	return phrases;
+}
+
+bool AgentControlView::extractWakeCommand(
+	const QString& transcript,
+	QString& commandRemainder,
+	bool& wakeDetected ) const
+{
+	wakeDetected = false;
+	commandRemainder = normalizeTranscriptForCommand( transcript );
+	if( commandRemainder.isEmpty() )
+	{
+		return false;
+	}
+
+	for( const QString& wake : wakePhrases() )
+	{
+		if( wake.isEmpty() )
+		{
+			continue;
+		}
+		const int idx = commandRemainder.indexOf( wake );
+		if( idx < 0 )
+		{
+			continue;
+		}
+
+		wakeDetected = true;
+		commandRemainder.remove( idx, wake.size() );
+		commandRemainder = commandRemainder.simplified();
+		return true;
+	}
+	return false;
+}
+
+QStringList AgentControlView::splitCommandChain( const QString& transcript ) const
+{
+	QString chain = normalizeTranscriptForCommand( transcript );
+	chain.replace( QRegularExpression( R"(\b(?:and then|then|after that|next)\b)" ),
+		QStringLiteral( "|" ) );
+	chain.replace( QRegularExpression(
+		R"(\band\s+(?=(?:open|show|new|create|make|import|load|set|add|remove|mute|solo|undo|divide|split|slice|raise|lower|increase|decrease|save|export)\b))" ),
+		QStringLiteral( "|" ) );
+	chain.replace( QRegularExpression( R"([,;])" ), QStringLiteral( "|" ) );
+
+	QStringList segments;
+	for( const QString& segment : chain.split( '|', Qt::SkipEmptyParts ) )
+	{
+		const QString trimmed = segment.trimmed();
+		if( !trimmed.isEmpty() )
+		{
+			segments << trimmed;
+		}
+	}
+	return segments;
+}
+
+QString AgentControlView::applyContextHints( const QString& commandText ) const
+{
+	QString out = normalizeTranscriptForCommand( commandText );
+	if( out.isEmpty() )
+	{
+		return out;
+	}
+
+	if( !m_lastContextImportedFile.isEmpty() &&
+		( out.contains( QStringLiteral( "this sample" ) ) || out.contains( QStringLiteral( "that sample" ) ) ||
+		  out.contains( QStringLiteral( "this file" ) ) || out.contains( QStringLiteral( "that file" ) ) ||
+		  out.contains( QStringLiteral( "it " ) ) || out.endsWith( QStringLiteral( " it" ) ) ) )
+	{
+		out.replace( QRegularExpression( R"(\b(this|that)\s+(sample|file|audio)\b)" ), m_lastContextImportedFile );
+		out.replace( QRegularExpression( R"(\bit\b)" ), m_lastContextImportedFile );
+	}
+
+	return out.simplified();
+}
+
+void AgentControlView::updateVoiceContextFromCommand( const QString& commandText )
+{
+	const QString normalized = normalizeTranscriptForCommand( commandText );
+	if( normalized.contains( QStringLiteral( "slicer" ) ) )
+	{
+		m_lastContextPlugin = QStringLiteral( "slicer" );
+	}
+	if( normalized.contains( QStringLiteral( "piano roll" ) ) )
+	{
+		m_lastContextWindow = QStringLiteral( "piano roll" );
+	}
+	if( normalized.contains( QStringLiteral( "song editor" ) ) )
+	{
+		m_lastContextWindow = QStringLiteral( "song editor" );
+	}
+	if( normalized.contains( QStringLiteral( "instrument track" ) ) )
+	{
+		m_lastContextTrack = QStringLiteral( "instrument track" );
+	}
+	if( normalized.contains( QStringLiteral( "sample track" ) ) )
+	{
+		m_lastContextTrack = QStringLiteral( "sample track" );
+	}
+
+	const QRegularExpression filePattern(
+		R"(\b([a-z0-9._-]+\.(?:wav|wave|aif|aiff|flac|ogg|mp3|m4a))\b)",
+		QRegularExpression::CaseInsensitiveOption );
+	const auto match = filePattern.match( normalized );
+	if( match.hasMatch() )
+	{
+		m_lastContextImportedFile = match.captured( 1 );
+	}
+}
+
+bool AgentControlView::isLikelySilentWav( const QString& audioPath, double* meanAbs ) const
+{
+	if( meanAbs != nullptr )
+	{
+		*meanAbs = 0.0;
+	}
+
+	QFile file( audioPath );
+	if( !file.open( QIODevice::ReadOnly ) )
+	{
+		return false;
+	}
+	const QByteArray data = file.readAll();
+	if( data.size() <= 48 )
+	{
+		return true;
+	}
+
+	const int start = qMin( 44, data.size() );
+	const char* bytes = data.constData() + start;
+	const int sampleBytes = data.size() - start;
+	const int16_t* samples = reinterpret_cast<const int16_t*>( bytes );
+	const int sampleCount = sampleBytes / static_cast<int>( sizeof( int16_t ) );
+	if( sampleCount <= 0 )
+	{
+		return true;
+	}
+
+	const int stride = qMax( 1, sampleCount / 12000 );
+	qint64 totalAbs = 0;
+	int counted = 0;
+	for( int i = 0; i < sampleCount; i += stride )
+	{
+		totalAbs += qAbs( static_cast<int>( samples[i] ) );
+		++counted;
+	}
+	if( counted <= 0 )
+	{
+		return true;
+	}
+
+	const double avgAbs = static_cast<double>( totalAbs ) / static_cast<double>( counted );
+	if( meanAbs != nullptr )
+	{
+		*meanAbs = avgAbs;
+	}
+
+	const int threshold = qEnvironmentVariableIntValue( "LMMS_VOICE_SILENCE_ABS_THRESHOLD" ) > 0
+		? qEnvironmentVariableIntValue( "LMMS_VOICE_SILENCE_ABS_THRESHOLD" )
+		: 120;
+	return avgAbs < static_cast<double>( threshold );
+}
+
+void AgentControlView::appendTrace( const QString& stage, const QJsonObject& payload ) const
+{
+	if( qEnvironmentVariableIntValue( "LMMS_VOICE_TRACE" ) != 1 )
+	{
+		return;
+	}
+
+	QJsonObject event = payload;
+	event.insert( QStringLiteral( "stage" ), stage );
+	event.insert( QStringLiteral( "ts_ms" ), QString::number( QDateTime::currentMSecsSinceEpoch() ) );
+	const QString json = QString::fromUtf8( QJsonDocument( event ).toJson( QJsonDocument::Compact ) );
+	const_cast<AgentControlView*>( this )->appendLog( QStringLiteral( "TRACE %1" ).arg( json ) );
+}
+
 void AgentControlView::startVoiceCapture()
 {
 	if( m_voiceRecordProcess != nullptr )
@@ -544,12 +774,17 @@ void AgentControlView::startVoiceCapture()
 		return;
 	}
 
-	m_processedVoiceChunks.clear();
+	m_voiceChunkStates.clear();
+	m_processingVoiceChunks = false;
+	m_reprocessVoiceChunks = false;
 	m_lastDispatchedTranscript.clear();
 	m_pendingTranscript.clear();
 	m_lastDispatchedAtMs = 0;
+	m_wakeWindowUntilMs = 0;
 	m_voiceAudioPath.clear();
 	m_whisperServiceReady = false;
+	m_whisperServiceFailureCount = 0;
+	m_whisperServiceCooldownUntilMs = 0;
 
 	m_voiceRecordProcess = new QProcess( this );
 	connect( m_voiceRecordProcess,
@@ -586,6 +821,11 @@ void AgentControlView::startVoiceCapture()
 	}
 
 	m_voiceChunkTimer->start();
+	appendTrace( QStringLiteral( "voice_start" ), QJsonObject
+	{
+		{ "poll_ms", m_voiceChunkTimer->interval() },
+		{ "wake_required", wakePhraseRequired() }
+	} );
 	appendLog( tr( "Voice listener started. Relevant commands execute automatically." ) );
 	setVoiceUiState( true );
 }
@@ -637,9 +877,15 @@ void AgentControlView::stopVoiceCapture()
 		QDir( m_voiceChunkDir ).removeRecursively();
 		m_voiceChunkDir.clear();
 	}
-	m_processedVoiceChunks.clear();
+	m_voiceChunkStates.clear();
 	m_pendingTranscript.clear();
 	m_whisperServiceReady = false;
+	m_whisperServiceFailureCount = 0;
+	m_whisperServiceCooldownUntilMs = 0;
+	m_processingVoiceChunks = false;
+	m_reprocessVoiceChunks = false;
+	m_wakeWindowUntilMs = 0;
+	appendTrace( QStringLiteral( "voice_stop" ) );
 	appendLog( tr( "Voice listener stopped." ) );
 }
 
@@ -649,50 +895,120 @@ void AgentControlView::processVoiceChunks()
 	{
 		return;
 	}
-
-	QDir chunkDir( m_voiceChunkDir );
-	if( !chunkDir.exists() )
+	if( m_processingVoiceChunks )
 	{
+		m_reprocessVoiceChunks = true;
 		return;
 	}
 
-	const QStringList files = chunkDir.entryList(
-		QStringList{ QStringLiteral( "chunk_*.wav" ) },
-		QDir::Files,
-		QDir::Name );
-	const bool isRecording = m_voiceRecordProcess != nullptr &&
-		m_voiceRecordProcess->state() != QProcess::NotRunning;
-
-	for( int i = 0; i < files.size(); ++i )
+	m_processingVoiceChunks = true;
+	do
 	{
-		const QString& fileName = files[i];
-		if( m_processedVoiceChunks.contains( fileName ) )
+		m_reprocessVoiceChunks = false;
+
+		QDir chunkDir( m_voiceChunkDir );
+		if( !chunkDir.exists() )
 		{
-			continue;
-		}
-		// Skip the newest segment while ffmpeg is still writing.
-		if( isRecording && i == files.size() - 1 )
-		{
-			continue;
+			break;
 		}
 
-		const QString audioPath = chunkDir.filePath( fileName );
-		const QFileInfo audioInfo( audioPath );
-		if( !audioInfo.exists() || audioInfo.size() < 2048 )
+		const QStringList files = chunkDir.entryList(
+			QStringList{ QStringLiteral( "chunk_*.wav" ) },
+			QDir::Files,
+			QDir::Name );
+		const bool isRecording = m_voiceRecordProcess != nullptr &&
+			m_voiceRecordProcess->state() != QProcess::NotRunning;
+		const int minBytes = qEnvironmentVariableIntValue( "LMMS_VOICE_MIN_BYTES" ) > 0
+			? qEnvironmentVariableIntValue( "LMMS_VOICE_MIN_BYTES" )
+			: 4096;
+
+		for( int i = 0; i < files.size(); ++i )
 		{
-			continue;
+			const QString& fileName = files[i];
+			const VoiceChunkStatus state = m_voiceChunkStates.value( fileName, VoiceChunkStatus::Seen );
+			if( state == VoiceChunkStatus::Processing || state == VoiceChunkStatus::Done )
+			{
+				continue;
+			}
+			// Skip the newest segment while ffmpeg may still be writing to it.
+			if( isRecording && i == files.size() - 1 )
+			{
+				m_voiceChunkStates.insert( fileName, VoiceChunkStatus::Seen );
+				continue;
+			}
+
+			const QString audioPath = chunkDir.filePath( fileName );
+			const QFileInfo audioInfo( audioPath );
+			if( !audioInfo.exists() )
+			{
+				m_voiceChunkStates.insert( fileName, VoiceChunkStatus::Error );
+				continue;
+			}
+			if( audioInfo.size() < minBytes )
+			{
+				if( isRecording )
+				{
+					m_voiceChunkStates.insert( fileName, VoiceChunkStatus::Seen );
+					continue;
+				}
+				m_voiceChunkStates.insert( fileName, VoiceChunkStatus::Done );
+				QFile::remove( audioPath );
+				QFile::remove( audioPath + QStringLiteral( ".txt" ) );
+				continue;
+			}
+
+			m_voiceChunkStates.insert( fileName, VoiceChunkStatus::Processing );
+
+			double avgAbs = 0.0;
+			if( isLikelySilentWav( audioPath, &avgAbs ) )
+			{
+				m_voiceChunkStates.insert( fileName, VoiceChunkStatus::Done );
+				appendTrace( QStringLiteral( "chunk_silent" ), QJsonObject
+				{
+					{ "file", fileName },
+					{ "avg_abs", avgAbs }
+				} );
+				QFile::remove( audioPath );
+				QFile::remove( audioPath + QStringLiteral( ".txt" ) );
+				continue;
+			}
+
+			QString transcript;
+			if( transcribeAudio( audioPath, transcript, true ) )
+			{
+				dispatchTranscript( transcript );
+				m_voiceChunkStates.insert( fileName, VoiceChunkStatus::Done );
+			}
+			else
+			{
+				m_voiceChunkStates.insert( fileName, VoiceChunkStatus::Error );
+			}
+
+			QFile::remove( audioPath );
+			QFile::remove( audioPath + QStringLiteral( ".txt" ) );
 		}
 
-		m_processedVoiceChunks.insert( fileName );
-		QString transcript;
-		if( transcribeAudio( audioPath, transcript, true ) )
+		// Prevent unbounded state growth from removed segment files.
+		QSet<QString> currentFileSet;
+		for( const QString& name : files )
 		{
-			dispatchTranscript( transcript );
+			currentFileSet.insert( name );
 		}
-
-		QFile::remove( audioPath );
-		QFile::remove( audioPath + QStringLiteral( ".txt" ) );
+		for( auto it = m_voiceChunkStates.begin(); it != m_voiceChunkStates.end(); )
+		{
+			if( !currentFileSet.contains( it.key() ) &&
+				( it.value() == VoiceChunkStatus::Done || it.value() == VoiceChunkStatus::Error ) )
+			{
+				it = m_voiceChunkStates.erase( it );
+			}
+			else
+			{
+				++it;
+			}
+		}
 	}
+	while( m_reprocessVoiceChunks );
+	m_processingVoiceChunks = false;
 }
 
 bool AgentControlView::transcribeAudio(
@@ -701,10 +1017,17 @@ bool AgentControlView::transcribeAudio(
 	bool quietNoTranscript )
 {
 	transcript.clear();
+	QElapsedTimer timer;
+	timer.start();
 	if( useWhisperService() )
 	{
 		QString serviceError;
-		if( !m_whisperServiceReady )
+		const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+		if( nowMs < m_whisperServiceCooldownUntilMs )
+		{
+			serviceError = tr( "service cooldown active" );
+		}
+		if( serviceError.isEmpty() && !m_whisperServiceReady )
 		{
 			m_whisperServiceReady = ensureWhisperServiceReady( serviceError );
 			if( !m_whisperServiceReady && !quietNoTranscript && !serviceError.isEmpty() )
@@ -712,16 +1035,22 @@ bool AgentControlView::transcribeAudio(
 				appendLog( tr( "Whisper service unavailable: %1. Falling back to CLI." ).arg( serviceError ) );
 			}
 		}
-		if( m_whisperServiceReady && transcribeViaWhisperService( audioPath, transcript, serviceError ) )
+		if( serviceError.isEmpty() && m_whisperServiceReady &&
+			transcribeViaWhisperService( audioPath, transcript, serviceError ) )
 		{
+			m_whisperServiceFailureCount = 0;
+			m_whisperServiceCooldownUntilMs = 0;
 			if( !quietNoTranscript )
 			{
 				appendLog( tr( "Whisper service transcription completed." ) );
 			}
 		}
-		else if( m_whisperServiceReady )
+		else if( m_whisperServiceReady || !serviceError.isEmpty() )
 		{
 			m_whisperServiceReady = false;
+			m_whisperServiceFailureCount = qMin( m_whisperServiceFailureCount + 1, 8 );
+			const qint64 backoffMs = qMin<qint64>( 20000, 1000 * ( 1 << qMin( m_whisperServiceFailureCount, 4 ) ) );
+			m_whisperServiceCooldownUntilMs = QDateTime::currentMSecsSinceEpoch() + backoffMs;
 			if( !quietNoTranscript && !serviceError.isEmpty() )
 			{
 				appendLog( tr( "Whisper service transcription failed: %1. Falling back to CLI." ).arg( serviceError ) );
@@ -799,6 +1128,12 @@ bool AgentControlView::transcribeAudio(
 		}
 	}
 
+	appendTrace( QStringLiteral( "transcribe_complete" ), QJsonObject
+	{
+		{ "ms", timer.elapsed() },
+		{ "chars", transcript.size() },
+		{ "service_ready", m_whisperServiceReady }
+	} );
 	return !transcript.trimmed().isEmpty();
 }
 
@@ -889,83 +1224,158 @@ bool AgentControlView::looksLikeCommandTranscript( const QString& transcript ) c
 
 bool AgentControlView::dispatchTranscript( const QString& transcript )
 {
-	const QString cleanTranscript = transcript.trimmed();
+	const QString cleanTranscript = normalizeTranscriptForCommand( transcript );
 	if( cleanTranscript.isEmpty() )
 	{
 		return false;
 	}
 
-	QStringList candidates;
-	candidates << cleanTranscript;
-	if( !m_pendingTranscript.isEmpty() )
+	QString wakeFiltered = cleanTranscript;
+	bool wakeDetected = false;
+	extractWakeCommand( cleanTranscript, wakeFiltered, wakeDetected );
+
+	const int wakeWindowMs = qEnvironmentVariableIntValue( "LMMS_WAKE_WINDOW_MS" ) > 0
+		? qEnvironmentVariableIntValue( "LMMS_WAKE_WINDOW_MS" )
+		: 8000;
+	const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+	if( wakeDetected )
 	{
-		candidates << ( m_pendingTranscript + QStringLiteral( " " ) + cleanTranscript ).simplified();
+		m_wakeWindowUntilMs = nowMs + qMax( 3000, wakeWindowMs );
+		appendTrace( QStringLiteral( "wake_detected" ), QJsonObject
+		{
+			{ "wake_until_ms", QString::number( m_wakeWindowUntilMs ) },
+			{ "raw", cleanTranscript }
+		} );
 	}
 
-	for( const QString& candidate : candidates )
+	const bool wakeActive = !wakePhraseRequired() || nowMs <= m_wakeWindowUntilMs;
+	const QString effectiveTranscript = wakeDetected ? wakeFiltered : cleanTranscript;
+	if( effectiveTranscript.isEmpty() )
 	{
-		if( candidate.isEmpty() )
+		return wakeDetected;
+	}
+	if( !wakeActive )
+	{
+		appendTrace( QStringLiteral( "ignored_no_wake" ), QJsonObject
+		{
+			{ "raw", cleanTranscript }
+		} );
+		return false;
+	}
+
+	const QStringList chain = splitCommandChain( effectiveTranscript );
+	bool anyExecuted = false;
+	for( const QString& segmentRaw : chain )
+	{
+		const QString segment = applyContextHints( segmentRaw );
+		if( segment.isEmpty() )
 		{
 			continue;
 		}
-		if( !looksLikeCommandTranscript( candidate ) )
+
+		QStringList candidates;
+		candidates << segment;
+		if( !m_pendingTranscript.isEmpty() )
 		{
-			continue;
+			candidates << ( m_pendingTranscript + QStringLiteral( " " ) + segment ).simplified();
 		}
 
-		QString commandText = candidate;
-		QString fastCommand;
-		if( canonicalizeFastCommand( candidate, fastCommand ) )
+		bool executedForSegment = false;
+		for( const QString& candidate : candidates )
 		{
-			commandText = fastCommand;
+			if( candidate.isEmpty() )
+			{
+				continue;
+			}
+			if( !looksLikeCommandTranscript( candidate ) )
+			{
+				continue;
+			}
+
+			QString commandText = candidate;
+			QString fastCommand;
+			if( canonicalizeFastCommand( candidate, fastCommand ) )
+			{
+				commandText = fastCommand;
+			}
+
+			const QString normalized = commandText.toLower().simplified();
+			if( normalized == m_lastDispatchedTranscript && nowMs - m_lastDispatchedAtMs < 2000 )
+			{
+				continue;
+			}
+
+			const QString result = m_plugin->handleCommand( commandText );
+			if( result.startsWith( QStringLiteral( "Unknown command:" ), Qt::CaseInsensitive ) ||
+				result.startsWith( QStringLiteral( "Unknown window:" ), Qt::CaseInsensitive ) ||
+				result.startsWith( QStringLiteral( "Unknown instrument:" ), Qt::CaseInsensitive ) )
+			{
+				continue;
+			}
+
+			appendLog( tr( "Heard: %1" ).arg( cleanTranscript ) );
+			if( commandText.compare( segment, Qt::CaseInsensitive ) != 0 )
+			{
+				appendLog( tr( "Mapped: %1" ).arg( commandText ) );
+			}
+			appendLog( commandText + QStringLiteral( " => " ) + result );
+			appendTrace( QStringLiteral( "segment_executed" ), QJsonObject
+			{
+				{ "segment", segment },
+				{ "command", commandText },
+				{ "result", result }
+			} );
+			m_lastDispatchedTranscript = normalized;
+			m_lastDispatchedAtMs = nowMs;
+			m_pendingTranscript.clear();
+			updateVoiceContextFromCommand( commandText );
+			executedForSegment = true;
+			anyExecuted = true;
+			break;
 		}
 
-		const QString normalized = commandText.toLower().simplified();
-		const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-		if( normalized == m_lastDispatchedTranscript && nowMs - m_lastDispatchedAtMs < 2500 )
+		if( !executedForSegment )
 		{
-			return false;
+			const QStringList tokens = segment.toLower().simplified().split( ' ', Qt::SkipEmptyParts );
+			if( tokens.size() <= 4 )
+			{
+				m_pendingTranscript = segment;
+			}
+			else
+			{
+				m_pendingTranscript = tokens.mid( qMax( 0, tokens.size() - 4 ) ).join( ' ' );
+			}
 		}
-
-		const QString result = m_plugin->handleCommand( commandText );
-		if( result.startsWith( QStringLiteral( "Unknown command:" ), Qt::CaseInsensitive ) ||
-			result.startsWith( QStringLiteral( "Unknown window:" ), Qt::CaseInsensitive ) ||
-			result.startsWith( QStringLiteral( "Unknown instrument:" ), Qt::CaseInsensitive ) )
-		{
-			continue;
-		}
-
-		appendLog( tr( "Heard: %1" ).arg( cleanTranscript ) );
-		if( commandText.compare( cleanTranscript, Qt::CaseInsensitive ) != 0 )
-		{
-			appendLog( tr( "Fast map: %1" ).arg( commandText ) );
-		}
-		appendLog( commandText + QStringLiteral( " => " ) + result );
-		m_lastDispatchedTranscript = normalized;
-		m_lastDispatchedAtMs = nowMs;
-		m_pendingTranscript.clear();
-		return true;
 	}
 
-	const QStringList tokens = cleanTranscript.toLower().simplified().split( ' ', Qt::SkipEmptyParts );
-	if( tokens.size() <= 3 )
-	{
-		m_pendingTranscript = cleanTranscript;
-	}
-	else
-	{
-		m_pendingTranscript = tokens.mid( qMax( 0, tokens.size() - 3 ) ).join( ' ' );
-	}
-	return false;
+	return anyExecuted;
 }
 
 bool AgentControlView::canonicalizeFastCommand( const QString& transcript, QString& command ) const
 {
 	command.clear();
-	const QString normalized = transcript.toLower().simplified();
+	const QString normalized = normalizeTranscriptForCommand( transcript );
 	if( normalized.isEmpty() )
 	{
 		return false;
+	}
+
+	if( normalized == QStringLiteral( "play" ) ||
+		normalized == QStringLiteral( "start playback" ) ||
+		normalized == QStringLiteral( "resume playback" ) )
+	{
+		command = QStringLiteral( "play" );
+		return true;
+	}
+	if( normalized == QStringLiteral( "pause" ) || normalized == QStringLiteral( "pause playback" ) )
+	{
+		command = QStringLiteral( "pause" );
+		return true;
+	}
+	if( normalized == QStringLiteral( "stop" ) || normalized == QStringLiteral( "stop playback" ) )
+	{
+		command = QStringLiteral( "stop" );
+		return true;
 	}
 
 	if( normalized.contains( QStringLiteral( "open" ) ) &&
@@ -987,9 +1397,29 @@ bool AgentControlView::canonicalizeFastCommand( const QString& transcript, QStri
 			R"(\b([a-z0-9._-]+\.(?:wav|mp3|flac|aiff|ogg|m4a))\b)",
 			QRegularExpression::CaseInsensitiveOption );
 		const auto fileMatch = filePattern.match( normalized );
-		const QString fileName = fileMatch.hasMatch() ? fileMatch.captured( 1 ) : QStringLiteral( "sample.wav" );
+		QString fileName = fileMatch.hasMatch() ? fileMatch.captured( 1 ) : QString();
+		if( fileName.isEmpty() && !m_lastContextImportedFile.isEmpty() )
+		{
+			fileName = m_lastContextImportedFile;
+		}
+		if( fileName.isEmpty() )
+		{
+			fileName = QStringLiteral( "sample.wav" );
+		}
 		command = QStringLiteral( "import %1 into slicer" ).arg( fileName );
 		return true;
+	}
+	if( normalized.contains( QStringLiteral( "import" ) ) && normalized.contains( QStringLiteral( "download" ) ) )
+	{
+		const QRegularExpression filePattern(
+			R"(\b([a-z0-9._-]+\.(?:wav|mp3|flac|aiff|ogg|m4a|mid))\b)",
+			QRegularExpression::CaseInsensitiveOption );
+		const auto fileMatch = filePattern.match( normalized );
+		if( fileMatch.hasMatch() )
+		{
+			command = QStringLiteral( "import %1 from downloads" ).arg( fileMatch.captured( 1 ) );
+			return true;
+		}
 	}
 
 	if( ( normalized.contains( QStringLiteral( "divide" ) ) || normalized.contains( QStringLiteral( "split" ) ) ) &&
@@ -1006,6 +1436,31 @@ bool AgentControlView::canonicalizeFastCommand( const QString& transcript, QStri
 		command = QStringLiteral( "divide into equal segments" );
 		return true;
 	}
+	if( ( normalized.contains( QStringLiteral( "divide" ) ) || normalized.contains( QStringLiteral( "split" ) ) ) &&
+		normalized.contains( QStringLiteral( "segment" ) ) )
+	{
+		const QRegularExpression countPattern( R"(\b(\d{1,3})\b)" );
+		const auto countMatch = countPattern.match( normalized );
+		if( countMatch.hasMatch() )
+		{
+			command = QStringLiteral( "divide into %1 equal segments" ).arg( countMatch.captured( 1 ) );
+		}
+		else
+		{
+			command = QStringLiteral( "divide into equal segments" );
+		}
+		return true;
+	}
+	if( normalized.contains( QStringLiteral( "split it into" ) ) ||
+		normalized.contains( QStringLiteral( "divide it into" ) ) )
+	{
+		const QRegularExpression countPattern( R"(\b(\d{1,3})\b)" );
+		const auto countMatch = countPattern.match( normalized );
+		command = countMatch.hasMatch()
+			? QStringLiteral( "divide into %1 equal segments" ).arg( countMatch.captured( 1 ) )
+			: QStringLiteral( "divide into equal segments" );
+		return true;
+	}
 
 	if( ( normalized.contains( QStringLiteral( "create" ) ) || normalized.contains( QStringLiteral( "new" ) ) ||
 		  normalized.contains( QStringLiteral( "make" ) ) ) &&
@@ -1015,12 +1470,60 @@ bool AgentControlView::canonicalizeFastCommand( const QString& transcript, QStri
 		command = QStringLiteral( "create instrument track" );
 		return true;
 	}
+	if( ( normalized.contains( QStringLiteral( "create" ) ) || normalized.contains( QStringLiteral( "new" ) ) ||
+		  normalized.contains( QStringLiteral( "make" ) ) ) &&
+		normalized.contains( QStringLiteral( "sample" ) ) &&
+		normalized.contains( QStringLiteral( "track" ) ) )
+	{
+		command = QStringLiteral( "create sample track" );
+		return true;
+	}
+	if( ( normalized.contains( QStringLiteral( "create" ) ) || normalized.contains( QStringLiteral( "new" ) ) ) &&
+		normalized.contains( QStringLiteral( "automation" ) ) &&
+		normalized.contains( QStringLiteral( "track" ) ) )
+	{
+		command = QStringLiteral( "create automation track" );
+		return true;
+	}
+	if( ( normalized.contains( QStringLiteral( "create" ) ) || normalized.contains( QStringLiteral( "new" ) ) ) &&
+		normalized.contains( QStringLiteral( "pattern" ) ) &&
+		normalized.contains( QStringLiteral( "track" ) ) )
+	{
+		command = QStringLiteral( "create pattern track" );
+		return true;
+	}
 
 	if( ( normalized.contains( QStringLiteral( "open" ) ) || normalized.contains( QStringLiteral( "show" ) ) ) &&
 		normalized.contains( QStringLiteral( "piano" ) ) &&
 		( normalized.contains( QStringLiteral( "roll" ) ) || normalized.contains( QStringLiteral( "role" ) ) ) )
 	{
 		command = QStringLiteral( "open piano roll" );
+		return true;
+	}
+	if( ( normalized.contains( QStringLiteral( "open" ) ) || normalized.contains( QStringLiteral( "show" ) ) ) &&
+		( normalized.contains( QStringLiteral( "pattern editor" ) ) ||
+		  normalized.contains( QStringLiteral( "beat and bassline" ) ) ||
+		  normalized.contains( QStringLiteral( "beat+bassline" ) ) ) )
+	{
+		command = QStringLiteral( "open pattern editor" );
+		return true;
+	}
+	if( ( normalized.contains( QStringLiteral( "open" ) ) || normalized.contains( QStringLiteral( "show" ) ) ) &&
+		( normalized.contains( QStringLiteral( "mixer" ) ) || normalized.contains( QStringLiteral( "effects" ) ) ) )
+	{
+		command = QStringLiteral( "open mixer" );
+		return true;
+	}
+	if( ( normalized.contains( QStringLiteral( "open" ) ) || normalized.contains( QStringLiteral( "show" ) ) ) &&
+		normalized.contains( QStringLiteral( "controller rack" ) ) )
+	{
+		command = QStringLiteral( "open controller rack" );
+		return true;
+	}
+	if( ( normalized.contains( QStringLiteral( "open" ) ) || normalized.contains( QStringLiteral( "show" ) ) ) &&
+		normalized.contains( QStringLiteral( "project notes" ) ) )
+	{
+		command = QStringLiteral( "open project notes" );
 		return true;
 	}
 
@@ -1036,12 +1539,43 @@ bool AgentControlView::canonicalizeFastCommand( const QString& transcript, QStri
 		command = QStringLiteral( "add kick drums" );
 		return true;
 	}
+	if( normalized.contains( QStringLiteral( "add snare" ) ) )
+	{
+		command = QStringLiteral( "add snare" );
+		return true;
+	}
+	if( normalized.contains( QStringLiteral( "add effect " ) ) )
+	{
+		command = normalized;
+		return true;
+	}
+	if( normalized.contains( QStringLiteral( "remove effect " ) ) )
+	{
+		command = normalized;
+		return true;
+	}
 
 	if( ( normalized.contains( QStringLiteral( "open" ) ) || normalized.contains( QStringLiteral( "show" ) ) ) &&
 		normalized.contains( QStringLiteral( "song" ) ) &&
 		( normalized.contains( QStringLiteral( "editor" ) ) || normalized.contains( QStringLiteral( "edit" ) ) ) )
 	{
 		command = QStringLiteral( "open song editor" );
+		return true;
+	}
+	if( normalized == QStringLiteral( "new project" ) )
+	{
+		command = QStringLiteral( "new project" );
+		return true;
+	}
+	if( normalized == QStringLiteral( "save project" ) )
+	{
+		command = QStringLiteral( "save project" );
+		return true;
+	}
+	if( normalized.contains( QStringLiteral( "export song" ) ) ||
+		normalized.contains( QStringLiteral( "render song" ) ) )
+	{
+		command = QStringLiteral( "export song" );
 		return true;
 	}
 

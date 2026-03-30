@@ -1,5 +1,6 @@
 #include "AgentControl.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QCoreApplication>
 #include <QFile>
@@ -15,6 +16,7 @@
 #include <QProcess>
 #include <QRegularExpressionMatch>
 #include <QMetaObject>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QThread>
@@ -55,6 +57,240 @@
 
 namespace lmms
 {
+
+namespace
+{
+
+struct IntentProfile
+{
+	QString intent;
+	QString risk;
+	QString capabilityKey;
+	QStringList aliases;
+};
+
+QString normalizeManifestToken( const QString& value )
+{
+	QString normalized = value.toLower();
+	normalized.replace( QRegularExpression( R"([^a-z0-9])" ), QString() );
+	return normalized;
+}
+
+QList<IntentProfile> defaultIntentProfiles()
+{
+	return
+	{
+		{ QStringLiteral( "project.new" ), QStringLiteral( "confirm" ), QStringLiteral( "PROJECT_NEW" ), { QStringLiteral( "newproject" ) } },
+		{ QStringLiteral( "project.open" ), QStringLiteral( "confirm" ), QStringLiteral( "PROJECT_OPEN" ), { QStringLiteral( "openproject" ) } },
+		{ QStringLiteral( "project.save" ), QStringLiteral( "safe" ), QStringLiteral( "PROJECT_SAVE" ), { QStringLiteral( "saveproject" ), QStringLiteral( "saveprojectas" ) } },
+		{ QStringLiteral( "project.export" ), QStringLiteral( "confirm" ), QStringLiteral( "PROJECT_EXPORT" ), { QStringLiteral( "exportsong" ), QStringLiteral( "rendersong" ), QStringLiteral( "exporttracks" ) } },
+		{ QStringLiteral( "window.open" ), QStringLiteral( "safe" ), QStringLiteral( "WINDOW_OPEN" ), { QStringLiteral( "opensongeditor" ), QStringLiteral( "openpianoroll" ), QStringLiteral( "openautomationeditor" ), QStringLiteral( "openmixer" ), QStringLiteral( "showwindow" ) } },
+		{ QStringLiteral( "track.create" ), QStringLiteral( "safe" ), QStringLiteral( "TRACK_CREATE" ), { QStringLiteral( "createsampletrack" ), QStringLiteral( "createinstrumenttrack" ), QStringLiteral( "createautomationtrack" ), QStringLiteral( "createpatterntrack" ) } },
+		{ QStringLiteral( "track.state" ), QStringLiteral( "safe" ), QStringLiteral( "TRACK_STATE" ), { QStringLiteral( "mutetrack" ), QStringLiteral( "solotrack" ), QStringLiteral( "unmutetrack" ), QStringLiteral( "unsolotrack" ) } },
+		{ QStringLiteral( "slicer.open" ), QStringLiteral( "safe" ), QStringLiteral( "SLICER_OPEN" ), { QStringLiteral( "openslicer" ), QStringLiteral( "showslicer" ) } },
+		{ QStringLiteral( "slicer.import" ), QStringLiteral( "safe" ), QStringLiteral( "SLICER_IMPORT" ), { QStringLiteral( "intoslicer" ), QStringLiteral( "loadslicer" ) } },
+		{ QStringLiteral( "slicer.split.equal" ), QStringLiteral( "safe" ), QStringLiteral( "SLICER_SPLIT_EQUAL" ), { QStringLiteral( "equalsegments" ), QStringLiteral( "equalslices" ), QStringLiteral( "splitinto" ) } },
+		{ QStringLiteral( "slicer.split.transient" ), QStringLiteral( "safe" ), QStringLiteral( "SLICER_SPLIT_TRANSIENT" ), { QStringLiteral( "transientsegments" ), QStringLiteral( "transientslices" ) } },
+		{ QStringLiteral( "transport.play" ), QStringLiteral( "safe" ), QStringLiteral( "TRANSPORT_PLAY" ), { QStringLiteral( "play" ), QStringLiteral( "startplayback" ), QStringLiteral( "resumeplayback" ) } },
+		{ QStringLiteral( "transport.pause" ), QStringLiteral( "safe" ), QStringLiteral( "TRANSPORT_PAUSE" ), { QStringLiteral( "pause" ), QStringLiteral( "pauseplayback" ) } },
+		{ QStringLiteral( "transport.stop" ), QStringLiteral( "safe" ), QStringLiteral( "TRANSPORT_STOP" ), { QStringLiteral( "stop" ), QStringLiteral( "stopplayback" ) } },
+		{ QStringLiteral( "tempo.set" ), QStringLiteral( "safe" ), QStringLiteral( "TEMPO_SET" ), { QStringLiteral( "settempo" ), QStringLiteral( "bpm" ), QStringLiteral( "raisetempo" ), QStringLiteral( "lowertempo" ) } },
+		{ QStringLiteral( "pattern.rhythm" ), QStringLiteral( "safe" ), QStringLiteral( "PATTERN_RHYTHM" ), { QStringLiteral( "addkick" ), QStringLiteral( "addsnare" ), QStringLiteral( "add808" ), QStringLiteral( "addhihat" ), QStringLiteral( "addhats" ), QStringLiteral( "addcrash" ), QStringLiteral( "addride" ), QStringLiteral( "addcymbal" ) } },
+		{ QStringLiteral( "instrument.load" ), QStringLiteral( "safe" ), QStringLiteral( "INSTRUMENT_LOAD" ), { QStringLiteral( "loadinstrument" ), QStringLiteral( "newinstrument" ), QStringLiteral( "addpiano" ) } },
+		{ QStringLiteral( "mixer.effect.add" ), QStringLiteral( "safe" ), QStringLiteral( "MIXER_EFFECT_ADD" ), { QStringLiteral( "addeffect" ) } },
+		{ QStringLiteral( "mixer.effect.remove" ), QStringLiteral( "confirm" ), QStringLiteral( "MIXER_EFFECT_REMOVE" ), { QStringLiteral( "removeeffect" ) } },
+		{ QStringLiteral( "undo" ), QStringLiteral( "confirm" ), QStringLiteral( "UNDO" ), { QStringLiteral( "undo" ) } }
+	};
+}
+
+bool loadIntentProfilesFromManifest( const QString& manifestPath, QList<IntentProfile>& profiles, QString& error )
+{
+	QFile file( manifestPath );
+	if( !file.open( QIODevice::ReadOnly ) )
+	{
+		error = QObject::tr( "could not open %1" ).arg( manifestPath );
+		return false;
+	}
+
+	QJsonParseError parseError{};
+	const QJsonDocument doc = QJsonDocument::fromJson( file.readAll(), &parseError );
+	if( parseError.error != QJsonParseError::NoError || !doc.isObject() )
+	{
+		error = QObject::tr( "invalid JSON (%1)" ).arg( parseError.errorString() );
+		return false;
+	}
+
+	const QJsonArray intents = doc.object().value( QStringLiteral( "intents" ) ).toArray();
+	if( intents.isEmpty() )
+	{
+		error = QObject::tr( "missing intents array" );
+		return false;
+	}
+
+	QList<IntentProfile> loaded;
+	for( const QJsonValue& value : intents )
+	{
+		if( !value.isObject() )
+		{
+			continue;
+		}
+		const QJsonObject obj = value.toObject();
+		const QString intent = obj.value( QStringLiteral( "intent" ) ).toString().trimmed();
+		if( intent.isEmpty() )
+		{
+			continue;
+		}
+
+		QString risk = obj.value( QStringLiteral( "risk_level" ) ).toString().trimmed().toLower();
+		if( risk != QStringLiteral( "confirm" ) )
+		{
+			risk = QStringLiteral( "safe" );
+		}
+		const QString capability = obj.value( QStringLiteral( "capability_flag" ) ).toString().trimmed();
+		QStringList aliases;
+		for( const QJsonValue& alias : obj.value( QStringLiteral( "aliases" ) ).toArray() )
+		{
+			const QString normalizedAlias = normalizeManifestToken( alias.toString() );
+			if( !normalizedAlias.isEmpty() )
+			{
+				aliases << normalizedAlias;
+			}
+		}
+		aliases.removeDuplicates();
+		loaded.push_back( IntentProfile{ intent, risk, capability, aliases } );
+	}
+
+	if( loaded.isEmpty() )
+	{
+		error = QObject::tr( "no valid intent entries found" );
+		return false;
+	}
+	profiles = loaded;
+	return true;
+}
+
+bool validateLlmInterpretationObject( const QJsonObject& obj, QString& error )
+{
+	const auto hasType = [&obj]( const QString& key, QJsonValue::Type type )
+	{
+		return obj.contains( key ) && obj.value( key ).type() == type;
+	};
+
+	if( !hasType( QStringLiteral( "familiar" ), QJsonValue::Bool ) )
+	{
+		error = QObject::tr( "missing familiar bool" );
+		return false;
+	}
+	if( !obj.value( QStringLiteral( "familiar" ) ).toBool( false ) )
+	{
+		error = QObject::tr( "Ollama marked command as unfamiliar" );
+		return false;
+	}
+	if( !hasType( QStringLiteral( "intent" ), QJsonValue::String ) )
+	{
+		error = QObject::tr( "missing intent string" );
+		return false;
+	}
+	if( !hasType( QStringLiteral( "command" ), QJsonValue::String ) )
+	{
+		error = QObject::tr( "missing command string" );
+		return false;
+	}
+	if( !hasType( QStringLiteral( "arguments" ), QJsonValue::Object ) )
+	{
+		error = QObject::tr( "missing arguments object" );
+		return false;
+	}
+	if( !hasType( QStringLiteral( "confidence" ), QJsonValue::Double ) )
+	{
+		error = QObject::tr( "missing confidence number" );
+		return false;
+	}
+	const double confidence = obj.value( QStringLiteral( "confidence" ) ).toDouble( -1.0 );
+	if( confidence < 0.0 || confidence > 1.0 )
+	{
+		error = QObject::tr( "confidence out of range" );
+		return false;
+	}
+	if( !hasType( QStringLiteral( "risk_level" ), QJsonValue::String ) )
+	{
+		error = QObject::tr( "missing risk_level string" );
+		return false;
+	}
+	const QString risk = obj.value( QStringLiteral( "risk_level" ) ).toString().trimmed().toLower();
+	if( risk != QStringLiteral( "safe" ) && risk != QStringLiteral( "confirm" ) )
+	{
+		error = QObject::tr( "invalid risk_level value" );
+		return false;
+	}
+	if( !hasType( QStringLiteral( "reason" ), QJsonValue::String ) )
+	{
+		error = QObject::tr( "missing reason string" );
+		return false;
+	}
+	return true;
+}
+
+const QList<IntentProfile>& intentProfiles()
+{
+	static QList<IntentProfile> kProfiles;
+	static bool initialized = false;
+	if( initialized )
+	{
+		return kProfiles;
+	}
+
+	initialized = true;
+	kProfiles = defaultIntentProfiles();
+
+	QString manifestPath = qEnvironmentVariable( "LMMS_COMMAND_MANIFEST" ).trimmed();
+	if( manifestPath.isEmpty() )
+	{
+		const QString localRelative = QStringLiteral( "lmmsagent/integrations/lmms/AgentControl/command_manifest.v2.json" );
+		const QString cwdRelative = QDir::current().absoluteFilePath( localRelative );
+		if( QFileInfo::exists( cwdRelative ) )
+		{
+			manifestPath = cwdRelative;
+		}
+	}
+
+	if( !manifestPath.isEmpty() )
+	{
+		QString manifestError;
+		QList<IntentProfile> loadedProfiles;
+		if( loadIntentProfilesFromManifest( manifestPath, loadedProfiles, manifestError ) )
+		{
+			kProfiles = loadedProfiles;
+		}
+		else
+		{
+			qWarning() << "AgentControl: failed to load command manifest" << manifestPath << ":" << manifestError;
+		}
+	}
+
+	return kProfiles;
+}
+
+QString capabilityEnvForIntent( const QString& intent )
+{
+	for( const auto& profile : intentProfiles() )
+	{
+		if( intent == profile.intent )
+		{
+			if( !profile.capabilityKey.trimmed().isEmpty() )
+			{
+				return QStringLiteral( "LMMS_CAP_" ) + profile.capabilityKey;
+			}
+			break;
+		}
+	}
+
+	QString normalized = intent.toUpper();
+	normalized.replace( QRegularExpression( R"([^A-Z0-9]+)" ), QStringLiteral( "_" ) );
+	return QStringLiteral( "LMMS_CAP_" ) + normalized;
+}
+
+} // namespace
 
 extern "C"
 {
@@ -172,67 +408,239 @@ QString AgentControlService::handleCommand( const QString& rawText )
 		return tr( "No command provided" );
 	}
 
-	const QString directResult = dispatchCommandText( trimmed );
-	if( !isUnknownResponse( directResult ) )
+	const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+	if( !m_pendingConfirmationCommand.isEmpty() )
 	{
-		return directResult;
+		if( nowMs > m_pendingConfirmationExpiresMs )
+		{
+			emitTrace( "confirm_expired", QJsonObject
+			{
+				{ "intent", m_pendingConfirmationIntent },
+				{ "command", m_pendingConfirmationCommand }
+			} );
+			m_pendingConfirmationCommand.clear();
+			m_pendingConfirmationIntent.clear();
+			m_pendingConfirmationExpiresMs = 0;
+		}
+		else
+		{
+			const QString normalized = normalizeName( trimmed );
+			if( isConfirmationUtterance( trimmed ) )
+			{
+				const QString command = m_pendingConfirmationCommand;
+				const QString intent = m_pendingConfirmationIntent;
+				m_pendingConfirmationCommand.clear();
+				m_pendingConfirmationIntent.clear();
+				m_pendingConfirmationExpiresMs = 0;
+				const QString confirmedResult = dispatchCommandText( command );
+				emitTrace( "confirm_executed", QJsonObject
+				{
+					{ "intent", intent },
+					{ "command", command },
+					{ "result", confirmedResult }
+				} );
+				return tr( "Confirmed \"%1\". %2" ).arg( command, confirmedResult );
+			}
+			if( normalized == "no" || normalized == "cancel" || normalized == "stop" )
+			{
+				m_pendingConfirmationCommand.clear();
+				m_pendingConfirmationIntent.clear();
+				m_pendingConfirmationExpiresMs = 0;
+				emitTrace( "confirm_cancelled" );
+				return tr( "Cancelled pending command." );
+			}
+			if( !isFamiliarIntentText( trimmed ) )
+			{
+				return tr( "Awaiting confirmation. Say \"yes\" to run \"%1\" or \"cancel\"." )
+					.arg( m_pendingConfirmationCommand );
+			}
+
+			// Override pending confirmation when a new command intent arrives.
+			m_pendingConfirmationCommand.clear();
+			m_pendingConfirmationIntent.clear();
+			m_pendingConfirmationExpiresMs = 0;
+		}
 	}
 
-	const bool familiarRawIntent = isFamiliarIntentText( trimmed );
+	// Multi-step chaining for direct text/socket commands.
+	// Voice mode already performs chain splitting before dispatch, but this keeps
+	// the same behavior available across all command entry points.
+	QStringList chainedSegments;
+	{
+		QString chain = trimmed;
+		chain.replace(
+			QRegularExpression( R"(\b(?:and then|then|after that|next)\b)", QRegularExpression::CaseInsensitiveOption ),
+			QStringLiteral( "|" ) );
+		chain.replace(
+			QRegularExpression(
+				R"(\band\s+(?=(?:open|show|new|create|make|import|load|set|add|remove|mute|solo|undo|divide|split|slice|raise|lower|increase|decrease|save|export|play|pause|stop)\b))",
+				QRegularExpression::CaseInsensitiveOption ),
+			QStringLiteral( "|" ) );
+		chain.replace( QRegularExpression( R"([,;])" ), QStringLiteral( "|" ) );
+		chainedSegments = chain.split( '|', Qt::SkipEmptyParts );
+	}
+	if( chainedSegments.size() > 1 )
+	{
+		QStringList stepResults;
+		stepResults.reserve( chainedSegments.size() );
+		for( const QString& segment : chainedSegments )
+		{
+			const QString step = segment.trimmed();
+			if( step.isEmpty() )
+			{
+				continue;
+			}
+			stepResults << handleCommand( step );
+		}
+		if( !stepResults.isEmpty() )
+		{
+			return stepResults.join( QStringLiteral( ". " ) );
+		}
+	}
 
+	struct Candidate
+	{
+		QString command;
+		QString intent;
+		QString source;
+		QString reason;
+		QString risk;
+		double confidence = 0.0;
+		bool viable = false;
+		bool exact = false;
+	};
+
+	const bool familiarRawIntent = isFamiliarIntentText( trimmed );
+	Candidate directCandidate;
+	directCandidate.command = trimmed;
+	directCandidate.intent = inferIntentForCommand( trimmed );
+	directCandidate.source = QStringLiteral( "deterministic" );
+	directCandidate.confidence = 0.96;
+	directCandidate.exact = true;
+	directCandidate.viable = familiarRawIntent;
+
+	Candidate mappedCandidate;
 	QString mappedCommand;
 	QString mapReason;
 	if( applyHeuristicMappings( trimmed, mappedCommand, mapReason ) &&
 		!mappedCommand.isEmpty() &&
 		normalizeName( mappedCommand ) != normalizeName( trimmed ) )
 	{
-		const bool familiarMappedIntent = isFamiliarIntentText( mappedCommand );
-		if( familiarRawIntent || familiarMappedIntent )
+		mappedCandidate.command = mappedCommand;
+		mappedCandidate.source = QStringLiteral( "heuristic" );
+		mappedCandidate.reason = mapReason;
+		mappedCandidate.intent = inferIntentForCommand( mappedCommand );
+		mappedCandidate.confidence = 0.80;
+		mappedCandidate.viable = isFamiliarIntentText( mappedCommand );
+		if( mappedCandidate.viable )
 		{
-			const QString mappedResult = dispatchCommandText( mappedCommand );
-			if( !isUnknownResponse( mappedResult ) )
-			{
-				const QString reasonSuffix = mapReason.isEmpty() ? QString() : tr( " (%1)" ).arg( mapReason );
-				return tr( "Interpreted as \"%1\"%2. %3" )
-					.arg( mappedCommand, reasonSuffix, mappedResult );
-			}
+			// If heuristics found a cleaner deterministic command, prefer it over raw text.
+			directCandidate.viable = false;
+			directCandidate.exact = false;
 		}
 	}
 
-	// Hard safety gate: do not run LLM/planner fallbacks for unrelated speech.
-	if( !familiarRawIntent )
-	{
-		return directResult;
-	}
-
+	Candidate llmCandidate;
 	const QString ollamaModel = qEnvironmentVariable( "LMMS_OLLAMA_MODEL" ).trimmed();
 	if( !ollamaModel.isEmpty() )
 	{
-		double confidence = 0.0;
 		QString ollamaError;
-		QString ollamaCommand;
-		if( resolveWithOllama( trimmed, ollamaCommand, confidence, ollamaError ) )
+		QJsonObject llmArgs;
+		if( resolveWithOllama(
+			trimmed,
+			llmCandidate.command,
+			llmCandidate.intent,
+			llmArgs,
+			llmCandidate.risk,
+			llmCandidate.confidence,
+			llmCandidate.reason,
+			ollamaError ) )
 		{
-			const bool familiar = isFamiliarIntentText( ollamaCommand );
-			const double threshold = qEnvironmentVariable( "LMMS_OLLAMA_CONFIDENCE" ).toDouble() > 0.0
-				? qEnvironmentVariable( "LMMS_OLLAMA_CONFIDENCE" ).toDouble()
-				: 0.78;
-			if( familiar && confidence >= threshold )
+			llmCandidate.source = QStringLiteral( "llm" );
+			if( llmCandidate.intent.isEmpty() )
 			{
-				const QString ollamaResult = dispatchCommandText( ollamaCommand );
-				if( !isUnknownResponse( ollamaResult ) )
-				{
-					return tr( "Interpreted as \"%1\" (confidence %2). %3" )
-						.arg( ollamaCommand )
-						.arg( QString::number( confidence, 'f', 2 ) )
-						.arg( ollamaResult );
-				}
+				llmCandidate.intent = inferIntentForCommand( llmCandidate.command );
 			}
+			const double llmConfidenceFloor = qEnvironmentVariable( "LMMS_OLLAMA_CONFIDENCE" ).trimmed().toDouble() > 0.0
+				? qEnvironmentVariable( "LMMS_OLLAMA_CONFIDENCE" ).trimmed().toDouble()
+				: 0.72;
+			llmCandidate.viable = isFamiliarIntentText( llmCandidate.command ) &&
+				llmCandidate.confidence >= llmConfidenceFloor;
 		}
 		else if( !ollamaError.isEmpty() )
 		{
-			emit logMessage( tr( "Ollama fallback skipped: %1" ).arg( ollamaError ) );
+			emit logMessage( tr( "Ollama parse skipped: %1" ).arg( ollamaError ) );
 		}
+	}
+
+	emitTrace( "candidate_summary", QJsonObject
+	{
+		{ "input", trimmed },
+		{ "familiar_raw", familiarRawIntent },
+		{ "direct_ok", directCandidate.viable },
+		{ "mapped_ok", mappedCandidate.viable },
+		{ "llm_ok", llmCandidate.viable },
+		{ "llm_confidence", llmCandidate.confidence }
+	} );
+
+	Candidate chosen;
+	bool hasChosen = false;
+	if( directCandidate.viable )
+	{
+		// Exact deterministic match wins unless it is disabled by capability policy.
+		chosen = directCandidate;
+		hasChosen = true;
+	}
+	else if( mappedCandidate.viable )
+	{
+		chosen = mappedCandidate;
+		hasChosen = true;
+	}
+
+	if( llmCandidate.viable )
+	{
+		const double arbitrationMargin = qEnvironmentVariable( "LMMS_HYBRID_MARGIN" ).trimmed().toDouble() > 0.0
+			? qEnvironmentVariable( "LMMS_HYBRID_MARGIN" ).trimmed().toDouble()
+			: 0.12;
+		if( !hasChosen )
+		{
+			chosen = llmCandidate;
+			hasChosen = true;
+		}
+		else if( !chosen.exact &&
+			llmCandidate.confidence >= chosen.confidence + arbitrationMargin &&
+			!llmCandidate.reason.trimmed().isEmpty() )
+		{
+			chosen = llmCandidate;
+			hasChosen = true;
+		}
+	}
+
+	if( hasChosen )
+	{
+		const QString execution = executeWithSafetyGate(
+			chosen.command,
+			chosen.source,
+			chosen.confidence,
+			chosen.reason,
+			chosen.risk );
+		if( !isUnknownResponse( execution ) )
+		{
+			return execution;
+		}
+		emitTrace( "candidate_failed_dispatch", QJsonObject
+		{
+			{ "input", trimmed },
+			{ "chosen_source", chosen.source },
+			{ "chosen_command", chosen.command },
+			{ "result", execution }
+		} );
+	}
+
+	// Hard safety gate: do not run planner fallbacks for unrelated speech.
+	if( !familiarRawIntent )
+	{
+		return dispatchCommandText( trimmed );
 	}
 
 	QString plannerResult;
@@ -246,7 +654,7 @@ QString AgentControlService::handleCommand( const QString& rawText )
 		emit logMessage( tr( "Text-agent fallback skipped: %1" ).arg( plannerError ) );
 	}
 
-	return directResult;
+	return dispatchCommandText( trimmed );
 }
 
 QString AgentControlService::dispatchCommandText( const QString& rawText )
@@ -298,7 +706,7 @@ bool AgentControlService::isFamiliarIntentText( const QString& rawText ) const
 
 	const QSet<QString> simpleCommands =
 	{
-		"undo", "version", "help"
+		"undo", "version", "help", "play", "pause", "stop"
 	};
 	if( simpleCommands.contains( normalizeName( tokens.first() ) ) )
 	{
@@ -309,13 +717,15 @@ bool AgentControlService::isFamiliarIntentText( const QString& rawText ) const
 	{
 		"open", "show", "new", "create", "make", "import", "load", "set", "add", "remove",
 		"mute", "unmute", "solo", "unsolo", "undo", "tempo", "bpm", "divide",
-		"split", "slice", "raise", "lower", "increase", "decrease", "save", "list"
+		"split", "slice", "raise", "lower", "increase", "decrease", "save", "list",
+		"play", "pause", "stop", "resume", "start"
 	};
 	const QSet<QString> domainKeywords =
 	{
 		"project", "track", "instrument", "sample", "automation", "pattern", "mixer",
 		"piano", "roll", "editor", "song", "slicer", "splicer", "segment", "transient",
-		"slice", "effect", "plugin", "window", "tool", "file", "downloads"
+		"slice", "effect", "plugin", "window", "tool", "file", "downloads",
+		"hihat", "hat", "hats", "crash", "ride", "cymbal", "arpeggiator", "lane"
 	};
 
 	bool hasAction = false;
@@ -341,7 +751,9 @@ bool AgentControlService::isFamiliarIntentText( const QString& rawText ) const
 	{
 		"open", "show", "new", "create", "make", "import", "load", "set", "add", "remove",
 		"mute", "unmute", "solo", "unsolo", "undo", "tempo", "bpm", "divide",
-		"split", "slice", "openslicer", "showslicer", "manualmap", "beginnerhelp"
+		"split", "slice", "openslicer", "showslicer", "manualmap", "beginnerhelp",
+		"play", "pause", "stop", "resume", "startplayback", "stopplayback",
+		"hihat", "crash", "ride", "cymbal", "arpeggiator", "lane"
 	};
 
 	for( const QString& keyword : keywords )
@@ -379,7 +791,7 @@ bool AgentControlService::applyHeuristicMappings(
 	// Remove polite wrappers so command verbs are easier to parse.
 	bool removedConversationFiller = false;
 	const QRegularExpression leadingFiller(
-		R"(^(?:(?:hey|hi|yo|okay|ok|please|pls)\s+)*(?:(?:can|could|would)\s+(?:you|u)\s+)?(?:please|pls\s+)?(?:just\s+)?(?:hey\s+)?(?:can|could|would)?\s*(?:you|u)?\s*)",
+		R"(^(?:(?:hey|hi|yo|okay|ok|please|pls)\s+)*(?:(?:can|could|would)\s+(?:you|u)\s+)?(?:please|pls\s+)?(?:just\s+)?(?:hey\s+)?(?:can|could|would)?\s*(?:\b(?:you|u)\b\s*)?)",
 		QRegularExpression::CaseInsensitiveOption );
 	for( int i = 0; i < 2; ++i )
 	{
@@ -513,6 +925,12 @@ bool AgentControlService::applyHeuristicMappings(
 		}
 	}
 
+	if( collapsed.contains( "arpeggiator" ) && collapsed.contains( "lane" ) )
+	{
+		mappedCommand = QStringLiteral( "create arpeggiator lane" );
+		setReasonIfEmpty( tr( "normalized arpeggiator lane phrasing" ) );
+	}
+
 	// "lets go 128 bpm" -> "set tempo to 128"
 	const QRegularExpression bpmPhrase( R"(\b(\d{2,3})\s*bpm\b)", QRegularExpression::CaseInsensitiveOption );
 	const auto bpmMatch = bpmPhrase.match( mappedCommand );
@@ -520,6 +938,26 @@ bool AgentControlService::applyHeuristicMappings(
 	{
 		mappedCommand = tr( "set tempo to %1" ).arg( bpmMatch.captured( 1 ) );
 		setReasonIfEmpty( tr( "inferred tempo set intent" ) );
+	}
+
+	// Normalize common transport phrasing.
+	if( QRegularExpression( R"(\b(start|resume)\s+(playback|song)\b)",
+			QRegularExpression::CaseInsensitiveOption ).match( mappedCommand ).hasMatch() )
+	{
+		mappedCommand = QStringLiteral( "play" );
+		setReasonIfEmpty( tr( "normalized transport command" ) );
+	}
+	else if( QRegularExpression( R"(\bpause\s+(playback|song)\b)",
+		QRegularExpression::CaseInsensitiveOption ).match( mappedCommand ).hasMatch() )
+	{
+		mappedCommand = QStringLiteral( "pause" );
+		setReasonIfEmpty( tr( "normalized transport command" ) );
+	}
+	else if( QRegularExpression( R"(\bstop\s+(playback|song)\b)",
+		QRegularExpression::CaseInsensitiveOption ).match( mappedCommand ).hasMatch() )
+	{
+		mappedCommand = QStringLiteral( "stop" );
+		setReasonIfEmpty( tr( "normalized transport command" ) );
 	}
 
 	// "divide into 16 segments" -> "divide into 16 equal segments"
@@ -546,7 +984,9 @@ bool AgentControlService::applyHeuristicMappings(
 		"mute", "unmute", "solo", "unsolo", "undo", "tempo", "bpm", "divide", "split",
 		"slice", "slicer", "track", "instrument", "sample", "automation", "pattern",
 		"mixer", "project", "downloads", "equal", "segments", "transient",
-		"song", "editor", "piano", "roll", "window"
+		"hihat", "hat", "hats", "crash", "ride", "cymbal", "arpeggiator", "lane",
+		"song", "editor", "piano", "roll", "window", "play", "pause", "stop",
+		"start", "resume", "playback"
 	};
 	auto editDistance = []( const QString& a, const QString& b )
 	{
@@ -673,11 +1113,19 @@ bool AgentControlService::applyHeuristicMappings(
 bool AgentControlService::resolveWithOllama(
 	const QString& rawText,
 	QString& mappedCommand,
+	QString& intent,
+	QJsonObject& arguments,
+	QString& riskLevel,
 	double& confidence,
+	QString& reason,
 	QString& error ) const
 {
 	mappedCommand.clear();
+	intent.clear();
+	arguments = QJsonObject();
+	riskLevel.clear();
 	confidence = 0.0;
+	reason.clear();
 	error.clear();
 
 	const QString model = qEnvironmentVariable( "LMMS_OLLAMA_MODEL" ).trimmed();
@@ -693,10 +1141,12 @@ bool AgentControlService::resolveWithOllama(
 
 	const QString systemPrompt =
 		QStringLiteral(
-			"You map noisy LMMS voice commands to the closest valid command. "
-			"Only map if familiar with these command families: open/show/new/create/import/load/set/add/remove/mute/solo/undo/tempo/slicer. "
-			"Return JSON only: {\"familiar\":true|false,\"command\":\"...\",\"confidence\":0.0-1.0}. "
-			"If unclear or unrelated, return familiar=false, empty command, low confidence." );
+			"You map noisy LMMS voice commands to the closest executable LMMS command. "
+			"Use these command families: open/show/new/create/import/load/set/add/remove/mute/solo/undo/tempo/slicer/save/export. "
+			"Return JSON only with this schema: "
+			"{\"familiar\":bool,\"intent\":string,\"command\":string,\"arguments\":object,"
+			"\"confidence\":number,\"risk_level\":\"safe|confirm\",\"reason\":string}. "
+			"If unclear or unrelated, return familiar=false with low confidence and empty command." );
 
 	const QJsonObject payload
 	{
@@ -717,7 +1167,10 @@ bool AgentControlService::resolveWithOllama(
 	QNetworkReply *reply = manager.post( request, QJsonDocument( payload ).toJson( QJsonDocument::Compact ) );
 	QEventLoop loop;
 	QObject::connect( reply, &QNetworkReply::finished, &loop, &QEventLoop::quit );
-	QTimer::singleShot( 2500, &loop, &QEventLoop::quit );
+	const int timeoutMs = qEnvironmentVariableIntValue( "LMMS_OLLAMA_TIMEOUT_MS" ) > 0
+		? qEnvironmentVariableIntValue( "LMMS_OLLAMA_TIMEOUT_MS" )
+		: 2500;
+	QTimer::singleShot( qMax( 800, timeoutMs ), &loop, &QEventLoop::quit );
 	loop.exec();
 
 	if( reply->isRunning() )
@@ -769,18 +1222,25 @@ bool AgentControlService::resolveWithOllama(
 	}
 
 	const QJsonObject mappedObj = mappedDoc.object();
-	if( !mappedObj.value( "familiar" ).toBool( false ) )
+	if( !validateLlmInterpretationObject( mappedObj, error ) )
 	{
-		error = tr( "Ollama marked command as unfamiliar" );
 		return false;
 	}
 
 	mappedCommand = mappedObj.value( "command" ).toString().trimmed();
+	intent = mappedObj.value( "intent" ).toString().trimmed();
+	arguments = mappedObj.value( "arguments" ).toObject();
 	confidence = mappedObj.value( "confidence" ).toDouble( 0.0 );
+	riskLevel = mappedObj.value( "risk_level" ).toString().trimmed().toLower();
+	reason = mappedObj.value( "reason" ).toString().trimmed();
 	if( mappedCommand.isEmpty() )
 	{
 		error = tr( "Ollama returned an empty command" );
 		return false;
+	}
+	if( riskLevel != QStringLiteral( "safe" ) && riskLevel != QStringLiteral( "confirm" ) )
+	{
+		riskLevel = QStringLiteral( "safe" );
 	}
 	return true;
 }
@@ -882,6 +1342,311 @@ bool AgentControlService::maybeRunTextAgentFallback(
 
 	result = tr( "Planner interpreted as \"%1\". %2" ).arg( mappedCommand, mappedResult );
 	return true;
+}
+
+QString AgentControlService::inferIntentForCommand( const QString& commandText ) const
+{
+	const QString normalized = normalizeName( commandText );
+	if( normalized.isEmpty() )
+	{
+		return {};
+	}
+
+	if( normalized == QStringLiteral( "undo" ) )
+	{
+		return QStringLiteral( "undo" );
+	}
+	if( normalized.contains( QStringLiteral( "openslicer" ) ) || normalized == QStringLiteral( "slicer" ) )
+	{
+		return QStringLiteral( "slicer.open" );
+	}
+	if( normalized.contains( QStringLiteral( "intoslicer" ) ) ||
+		( normalized.contains( QStringLiteral( "import" ) ) && normalized.contains( QStringLiteral( "slicer" ) ) ) )
+	{
+		return QStringLiteral( "slicer.import" );
+	}
+	if( normalized.contains( QStringLiteral( "transient" ) ) &&
+		( normalized.contains( QStringLiteral( "divide" ) ) || normalized.contains( QStringLiteral( "split" ) ) ) )
+	{
+		return QStringLiteral( "slicer.split.transient" );
+	}
+	if( ( normalized.contains( QStringLiteral( "divide" ) ) || normalized.contains( QStringLiteral( "split" ) ) ) &&
+		normalized.contains( QStringLiteral( "segment" ) ) )
+	{
+		return QStringLiteral( "slicer.split.equal" );
+	}
+	if( normalized.startsWith( QStringLiteral( "newproject" ) ) )
+	{
+		return QStringLiteral( "project.new" );
+	}
+	if( normalized.startsWith( QStringLiteral( "openproject" ) ) )
+	{
+		return QStringLiteral( "project.open" );
+	}
+	if( normalized.startsWith( QStringLiteral( "saveproject" ) ) )
+	{
+		return QStringLiteral( "project.save" );
+	}
+	if( normalized.contains( QStringLiteral( "exportsong" ) ) ||
+		normalized.contains( QStringLiteral( "rendersong" ) ) ||
+		normalized.contains( QStringLiteral( "exporttracks" ) ) )
+	{
+		return QStringLiteral( "project.export" );
+	}
+	if( ( normalized.startsWith( QStringLiteral( "open" ) ) || normalized.startsWith( QStringLiteral( "show" ) ) ) &&
+		( normalized.contains( QStringLiteral( "editor" ) ) || normalized.contains( QStringLiteral( "mixer" ) ) ||
+		  normalized.contains( QStringLiteral( "rack" ) ) || normalized.contains( QStringLiteral( "notes" ) ) ) )
+	{
+		return QStringLiteral( "window.open" );
+	}
+	if( normalized.contains( QStringLiteral( "create" ) ) && normalized.contains( QStringLiteral( "track" ) ) )
+	{
+		return QStringLiteral( "track.create" );
+	}
+	if( normalized.startsWith( QStringLiteral( "mute" ) ) ||
+		normalized.startsWith( QStringLiteral( "unmute" ) ) ||
+		normalized.startsWith( QStringLiteral( "solo" ) ) ||
+		normalized.startsWith( QStringLiteral( "unsolo" ) ) )
+	{
+		return QStringLiteral( "track.state" );
+	}
+	if( normalized.contains( QStringLiteral( "settempo" ) ) ||
+		normalized.contains( QStringLiteral( "bpm" ) ) ||
+		normalized.contains( QStringLiteral( "raisetempo" ) ) ||
+		normalized.contains( QStringLiteral( "lowertempo" ) ) )
+	{
+		return QStringLiteral( "tempo.set" );
+	}
+	if( normalized == QStringLiteral( "play" ) || normalized.contains( QStringLiteral( "startplayback" ) ) ||
+		normalized.contains( QStringLiteral( "resumeplayback" ) ) )
+	{
+		return QStringLiteral( "transport.play" );
+	}
+	if( normalized == QStringLiteral( "pause" ) || normalized.contains( QStringLiteral( "pauseplayback" ) ) )
+	{
+		return QStringLiteral( "transport.pause" );
+	}
+	if( normalized == QStringLiteral( "stop" ) || normalized.contains( QStringLiteral( "stopplayback" ) ) )
+	{
+		return QStringLiteral( "transport.stop" );
+	}
+	if( normalized.contains( QStringLiteral( "addkick" ) ) ||
+		normalized.contains( QStringLiteral( "addsnare" ) ) ||
+		normalized.contains( QStringLiteral( "add808" ) ) ||
+		normalized.contains( QStringLiteral( "addhihat" ) ) ||
+		normalized.contains( QStringLiteral( "addhats" ) ) ||
+		normalized.contains( QStringLiteral( "addcrash" ) ) ||
+		normalized.contains( QStringLiteral( "addride" ) ) ||
+		normalized.contains( QStringLiteral( "addcymbal" ) ) )
+	{
+		return QStringLiteral( "pattern.rhythm" );
+	}
+	if( normalized.contains( QStringLiteral( "arpeggiator" ) ) &&
+		normalized.contains( QStringLiteral( "lane" ) ) )
+	{
+		return QStringLiteral( "track.create" );
+	}
+	if( normalized.contains( QStringLiteral( "loadinstrument" ) ) ||
+		normalized.contains( QStringLiteral( "newinstrument" ) ) ||
+		normalized.contains( QStringLiteral( "addpiano" ) ) )
+	{
+		return QStringLiteral( "instrument.load" );
+	}
+	if( normalized.startsWith( QStringLiteral( "addeffect" ) ) )
+	{
+		return QStringLiteral( "mixer.effect.add" );
+	}
+	if( normalized.startsWith( QStringLiteral( "removeeffect" ) ) )
+	{
+		return QStringLiteral( "mixer.effect.remove" );
+	}
+
+	for( const auto& profile : intentProfiles() )
+	{
+		for( const QString& alias : profile.aliases )
+		{
+			if( normalized.contains( alias ) )
+			{
+				return profile.intent;
+			}
+		}
+	}
+
+	return {};
+}
+
+QString AgentControlService::normalizedRiskForIntent( const QString& intent ) const
+{
+	for( const auto& profile : intentProfiles() )
+	{
+		if( intent == profile.intent )
+		{
+			return profile.risk;
+		}
+	}
+	return QStringLiteral( "safe" );
+}
+
+bool AgentControlService::isIntentEnabled( const QString& intent ) const
+{
+	if( intent.trimmed().isEmpty() )
+	{
+		return true;
+	}
+	const QString envName = capabilityEnvForIntent( intent );
+	const QString raw = qEnvironmentVariable( envName.toUtf8().constData() ).trimmed().toLower();
+	if( raw.isEmpty() )
+	{
+		return true;
+	}
+	return !( raw == QStringLiteral( "0" ) ||
+		raw == QStringLiteral( "false" ) ||
+		raw == QStringLiteral( "off" ) ||
+		raw == QStringLiteral( "disabled" ) );
+}
+
+bool AgentControlService::commandNeedsConfirmation(
+	const QString& intent,
+	const QString& commandText,
+	const QString& riskHint ) const
+{
+	QString risk = riskHint.trimmed().toLower();
+	if( risk.isEmpty() )
+	{
+		risk = normalizedRiskForIntent( intent );
+	}
+	if( risk == QStringLiteral( "confirm" ) )
+	{
+		return true;
+	}
+
+	const QString normalized = normalizeName( commandText );
+	if( normalized.contains( QStringLiteral( "removeeffect" ) ) ||
+		normalized.contains( QStringLiteral( "deletetrack" ) ) ||
+		normalized.contains( QStringLiteral( "newproject" ) ) ||
+		normalized.contains( QStringLiteral( "openproject" ) ) ||
+		normalized.contains( QStringLiteral( "saveasdefaulttemplate" ) ) ||
+		normalized.contains( QStringLiteral( "export" ) ) )
+	{
+		return true;
+	}
+	return false;
+}
+
+bool AgentControlService::isConfirmationUtterance( const QString& rawText ) const
+{
+	const QString normalized = normalizeName( rawText );
+	return normalized == QStringLiteral( "yes" ) ||
+		normalized == QStringLiteral( "yep" ) ||
+		normalized == QStringLiteral( "confirm" ) ||
+		normalized == QStringLiteral( "confirmed" ) ||
+		normalized == QStringLiteral( "dothething" ) ||
+		normalized == QStringLiteral( "doit" ) ||
+		normalized == QStringLiteral( "proceed" );
+}
+
+QString AgentControlService::executeWithSafetyGate(
+	const QString& commandText,
+	const QString& source,
+	double confidence,
+	const QString& reason,
+	const QString& riskHint )
+{
+	const QString intent = inferIntentForCommand( commandText );
+	if( !isIntentEnabled( intent ) )
+	{
+		const QString capability = capabilityEnvForIntent( intent );
+		return tr( "Capability disabled for intent \"%1\". Set %2=1 to enable." )
+			.arg( intent, capability );
+	}
+
+	const double confirmConfidence = qEnvironmentVariable( "LMMS_CONFIRM_CONFIDENCE" ).trimmed().toDouble() > 0.0
+		? qEnvironmentVariable( "LMMS_CONFIRM_CONFIDENCE" ).trimmed().toDouble()
+		: 0.74;
+	const bool lowConfidenceLlm = source == QStringLiteral( "llm" ) && confidence < confirmConfidence;
+	const bool needsConfirmation = commandNeedsConfirmation( intent, commandText, riskHint ) || lowConfidenceLlm;
+	if( needsConfirmation )
+	{
+		QString commandForConfirm = commandText;
+		if( intent == QStringLiteral( "mixer.effect.remove" ) )
+		{
+			const QStringList parts = tokenizeCommand( commandText );
+			int fromIdx = -1;
+			for( int i = 0; i < parts.size(); ++i )
+			{
+				if( parts[i].compare( QStringLiteral( "from" ), Qt::CaseInsensitive ) == 0 )
+				{
+					fromIdx = i;
+					break;
+				}
+			}
+			if( fromIdx < 0 )
+			{
+				if( Track *track = findLastTrackOfTypes( { Track::Type::Instrument, Track::Type::Sample } ) )
+				{
+					commandForConfirm = commandText + QStringLiteral( " from " ) + track->name();
+				}
+			}
+		}
+
+		const int confirmWindowMs = qEnvironmentVariableIntValue( "LMMS_CONFIRM_WINDOW_MS" ) > 0
+			? qEnvironmentVariableIntValue( "LMMS_CONFIRM_WINDOW_MS" )
+			: 9000;
+		m_pendingConfirmationCommand = commandForConfirm;
+		m_pendingConfirmationIntent = intent;
+		m_pendingConfirmationExpiresMs = QDateTime::currentMSecsSinceEpoch() + qMax( 3000, confirmWindowMs );
+		emitTrace( "confirm_required", QJsonObject
+		{
+			{ "intent", intent },
+			{ "command", commandForConfirm },
+			{ "source", source },
+			{ "confidence", confidence },
+			{ "risk", riskHint.isEmpty() ? normalizedRiskForIntent( intent ) : riskHint }
+		} );
+		return tr( "Confirmation required: \"%1\". Say \"yes\" to execute or \"cancel\"." )
+			.arg( commandText );
+	}
+
+	const QString result = dispatchCommandText( commandText );
+	emitTrace( "command_executed", QJsonObject
+	{
+		{ "intent", intent },
+		{ "source", source },
+		{ "command", commandText },
+		{ "confidence", confidence },
+		{ "result", result }
+	} );
+
+	if( source == QStringLiteral( "deterministic" ) )
+	{
+		return result;
+	}
+
+	QString explanation = tr( "Interpreted as \"%1\"" ).arg( commandText );
+	if( !reason.trimmed().isEmpty() )
+	{
+		explanation += tr( " (%1)" ).arg( reason.trimmed() );
+	}
+	if( confidence > 0.0 )
+	{
+		explanation += tr( " [confidence %1]" ).arg( QString::number( confidence, 'f', 2 ) );
+	}
+	return explanation + QStringLiteral( ". " ) + result;
+}
+
+void AgentControlService::emitTrace( const QString& stage, const QJsonObject& payload )
+{
+	const int traceEnabled = qEnvironmentVariableIntValue( "LMMS_VOICE_TRACE" );
+	if( traceEnabled != 1 )
+	{
+		return;
+	}
+
+	QJsonObject event = payload;
+	event.insert( "stage", stage );
+	event.insert( "ts_ms", QString::number( QDateTime::currentMSecsSinceEpoch() ) );
+	emit logMessage( QStringLiteral( "TRACE %1" )
+		.arg( QString::fromUtf8( QJsonDocument( event ).toJson( QJsonDocument::Compact ) ) ) );
 }
 
 QString AgentControlService::handleJson( const QJsonObject& obj )
@@ -1047,6 +1812,41 @@ QString AgentControlService::dispatchTokens( const QStringList& tokens, const QS
 		return error.isEmpty() ? result : error;
 	}
 
+	// Transport controls: keep these deterministic and low latency.
+	if( first == "play" || ( first == "start" && containsPhrase( "playback" ) ) ||
+		( first == "resume" && containsPhrase( "playback" ) ) )
+	{
+		Song *song = Engine::getSong();
+		if( song == nullptr )
+		{
+			return tr( "No active song" );
+		}
+		song->playSong();
+		return tr( "Playback started" );
+	}
+
+	if( first == "pause" )
+	{
+		Song *song = Engine::getSong();
+		if( song == nullptr )
+		{
+			return tr( "No active song" );
+		}
+		song->togglePause();
+		return tr( "Playback toggled" );
+	}
+
+	if( first == "stop" && !containsPhrase( "confirm" ) )
+	{
+		Song *song = Engine::getSong();
+		if( song == nullptr )
+		{
+			return tr( "No active song" );
+		}
+		song->stop();
+		return tr( "Playback stopped" );
+	}
+
 	// Keep direct command mode usable for quick tempo changes from the plugin UI.
 	// Natural-language planning still lives in the text/voice agent.
 	if( mentionsTempo &&
@@ -1206,6 +2006,22 @@ QString AgentControlService::dispatchTokens( const QStringList& tokens, const QS
 
 	if( first == "new" )
 	{
+		if( normalizeName( rawText ).contains( "arpeggiator" ) &&
+			normalizeName( rawText ).contains( "lane" ) )
+		{
+			QString createResult;
+			if( !createTrack( Track::Type::Pattern, createResult, error ) )
+			{
+				return error;
+			}
+			QString openResult;
+			QString openError;
+			if( !showWindowCommand( QStringLiteral( "piano roll" ), openResult, openError ) )
+			{
+				return createResult;
+			}
+			return tr( "Mapped arpeggiator lane to pattern workflow. %1. %2" ).arg( createResult, openResult );
+		}
 		if( tokens.size() >= 2 && tokens[1].compare( "project", Qt::CaseInsensitive ) == 0 )
 		{
 			return newProject( result, error ) ? result : error;
@@ -1232,6 +2048,22 @@ QString AgentControlService::dispatchTokens( const QStringList& tokens, const QS
 	}
 	if( first == "create" )
 	{
+		if( normalizeName( rawText ).contains( "arpeggiator" ) &&
+			normalizeName( rawText ).contains( "lane" ) )
+		{
+			QString createResult;
+			if( !createTrack( Track::Type::Pattern, createResult, error ) )
+			{
+				return error;
+			}
+			QString openResult;
+			QString openError;
+			if( !showWindowCommand( QStringLiteral( "piano roll" ), openResult, openError ) )
+			{
+				return createResult;
+			}
+			return tr( "Mapped arpeggiator lane to pattern workflow. %1. %2" ).arg( createResult, openResult );
+		}
 		if( tokens.size() >= 3 && tokens[1].compare( "sample", Qt::CaseInsensitive ) == 0 &&
 			tokens[2].compare( "track", Qt::CaseInsensitive ) == 0 )
 		{
@@ -1342,6 +2174,13 @@ QString AgentControlService::dispatchTokens( const QStringList& tokens, const QS
 
 	if( first == "add" )
 	{
+		if( tokens.size() >= 3 && tokens[1].compare( "effect", Qt::CaseInsensitive ) == 0 )
+		{
+			int toIndex = tokens.indexOf( "to" );
+			const QString effectName = toIndex > 2 ? tokens.mid( 2, toIndex - 2 ).join( " " ) : joinTokens( tokens, 2 );
+			const QString trackName = toIndex >= 0 ? joinTokens( tokens, toIndex + 1 ) : QString();
+			return addEffectToTrack( effectName, trackName, result, error ) ? result : error;
+		}
 		if( rawText.contains( "piano", Qt::CaseInsensitive ) )
 		{
 			QString createResult;
@@ -1359,12 +2198,21 @@ QString AgentControlService::dispatchTokens( const QStringList& tokens, const QS
 		{
 			return addSnarePattern( error ) ? tr( "Added snare pattern" ) : error;
 		}
-		if( tokens.size() >= 3 && tokens[1].compare( "effect", Qt::CaseInsensitive ) == 0 )
+		if( rawText.contains( "hihat", Qt::CaseInsensitive ) ||
+			rawText.contains( "hi-hat", Qt::CaseInsensitive ) ||
+			rawText.contains( "hi hat", Qt::CaseInsensitive ) ||
+			rawText.contains( "hats", Qt::CaseInsensitive ) )
 		{
-			int toIndex = tokens.indexOf( "to" );
-			const QString effectName = toIndex > 2 ? tokens.mid( 2, toIndex - 2 ).join( " " ) : joinTokens( tokens, 2 );
-			const QString trackName = toIndex >= 0 ? joinTokens( tokens, toIndex + 1 ) : QString();
-			return addEffectToTrack( effectName, trackName, result, error ) ? result : error;
+			return addHiHatPattern( error ) ? tr( "Added hi-hat pattern" ) : error;
+		}
+		if( rawText.contains( "ride", Qt::CaseInsensitive ) )
+		{
+			return addRidePattern( error ) ? tr( "Added ride pattern" ) : error;
+		}
+		if( rawText.contains( "crash", Qt::CaseInsensitive ) ||
+			rawText.contains( "cymbal", Qt::CaseInsensitive ) )
+		{
+			return addCrashPattern( error ) ? tr( "Added crash cymbal pattern" ) : error;
 		}
 	}
 
@@ -1533,11 +2381,17 @@ bool AgentControlService::handleSlicerWorkflow(
 			QRegularExpression::CaseInsensitiveOption );
 		const QRegularExpression afterEqual( R"(equal\s+(?:segments?|slices?)(?:\s+of)?\s+(\d+))",
 			QRegularExpression::CaseInsensitiveOption );
+		const QRegularExpression genericSegments( R"((\d+)\s+(?:segments?|slices?))",
+			QRegularExpression::CaseInsensitiveOption );
 
 		auto match = beforeEqual.match( rawText );
 		if( !match.hasMatch() )
 		{
 			match = afterEqual.match( rawText );
+		}
+		if( !match.hasMatch() )
+		{
+			match = genericSegments.match( rawText );
 		}
 		if( match.hasMatch() )
 		{
@@ -1989,21 +2843,35 @@ void AgentControlService::onNewConnection()
 
 void AgentControlService::onSocketReady()
 {
-	auto *sock = qobject_cast<QTcpSocket *>( sender() );
-	if( !sock )
+	QPointer<QTcpSocket> sock = qobject_cast<QTcpSocket *>( sender() );
+	if( !sock || !m_clients.contains( sock.data() ) )
 	{
 		return;
 	}
 
-	QByteArray& buffer = m_readBuffers[sock];
-	buffer.append( sock->readAll() );
+	m_readBuffers[sock.data()].append( sock->readAll() );
 
-	int newlineIndex = buffer.indexOf( '\n' );
-	while( newlineIndex >= 0 )
+	while( true )
 	{
-		const QByteArray line = buffer.left( newlineIndex );
-		buffer.remove( 0, newlineIndex + 1 );
-		newlineIndex = buffer.indexOf( '\n' );
+		if( !sock || !m_clients.contains( sock.data() ) )
+		{
+			return;
+		}
+
+		auto bufferIt = m_readBuffers.find( sock.data() );
+		if( bufferIt == m_readBuffers.end() )
+		{
+			return;
+		}
+
+		const int newlineIndex = bufferIt->indexOf( '\n' );
+		if( newlineIndex < 0 )
+		{
+			return;
+		}
+
+		const QByteArray line = bufferIt->left( newlineIndex );
+		bufferIt->remove( 0, newlineIndex + 1 );
 
 		if( line.trimmed().isEmpty() )
 		{
@@ -2044,7 +2912,19 @@ void AgentControlService::onSocketReady()
 			displayResult = reply.value( "error_message" ).toString();
 		}
 		emit commandResult( displayResult );
-		sock->write( QJsonDocument( reply ).toJson( QJsonDocument::Compact ) + "\n" );
+
+		if( !sock || !m_clients.contains( sock.data() ) ||
+			sock->state() != QAbstractSocket::ConnectedState )
+		{
+			return;
+		}
+
+		const QByteArray payload = QJsonDocument( reply ).toJson( QJsonDocument::Compact ) + "\n";
+		if( sock->write( payload ) < 0 )
+		{
+			emit logMessage( tr( "Failed to write response to client socket" ) );
+			return;
+		}
 		sock->flush();
 	}
 }
@@ -2081,6 +2961,7 @@ bool AgentControlService::newProject( QString& result, QString& error )
 	{
 		song->createNewProject();
 		m_projectTransitionQueued = false;
+		processDeferredOpenProject();
 	} );
 	result = tr( "Queued new project" );
 	return true;
@@ -2103,17 +2984,85 @@ bool AgentControlService::openProject( const QString& path, QString& result, QSt
 	}
 	if( m_projectTransitionQueued )
 	{
-		error = tr( "A project open/new operation is already in progress" );
-		return false;
+		scheduleDeferredOpenProject( fullPath );
+		result = tr( "Queued open project retry for %1" ).arg( QFileInfo( fullPath ).fileName() );
+		return true;
 	}
 	m_projectTransitionQueued = true;
 	QTimer::singleShot( 0, guiApp->mainWindow(), [this, song, fullPath]()
 	{
 		song->loadProject( fullPath );
 		m_projectTransitionQueued = false;
+		processDeferredOpenProject();
 	} );
 	result = tr( "Queued open project %1" ).arg( QFileInfo( fullPath ).fileName() );
 	return true;
+}
+
+void AgentControlService::scheduleDeferredOpenProject( const QString& fullPath )
+{
+	if( fullPath.isEmpty() )
+	{
+		return;
+	}
+
+	m_deferredOpenProjectPath = fullPath;
+	m_deferredOpenProjectRetries = 0;
+	QTimer::singleShot( 250, this, [this]()
+	{
+		processDeferredOpenProject();
+	} );
+}
+
+void AgentControlService::processDeferredOpenProject()
+{
+	if( m_deferredOpenProjectPath.isEmpty() )
+	{
+		return;
+	}
+
+	if( m_projectTransitionQueued )
+	{
+		++m_deferredOpenProjectRetries;
+		if( m_deferredOpenProjectRetries > 24 )
+		{
+			emit logMessage( tr( "Deferred open project timed out for %1" )
+				.arg( QFileInfo( m_deferredOpenProjectPath ).fileName() ) );
+			m_deferredOpenProjectPath.clear();
+			m_deferredOpenProjectRetries = 0;
+			return;
+		}
+
+		QTimer::singleShot( 250, this, [this]()
+		{
+			processDeferredOpenProject();
+		} );
+		return;
+	}
+
+	Song *song = Engine::getSong();
+	auto *guiApp = gui::getGUI();
+	if( song == nullptr || guiApp == nullptr || guiApp->mainWindow() == nullptr )
+	{
+		emit logMessage( tr( "Deferred open project skipped: GUI is not ready" ) );
+		m_deferredOpenProjectPath.clear();
+		m_deferredOpenProjectRetries = 0;
+		return;
+	}
+
+	const QString fullPath = m_deferredOpenProjectPath;
+	m_deferredOpenProjectPath.clear();
+	m_deferredOpenProjectRetries = 0;
+	m_projectTransitionQueued = true;
+
+	QTimer::singleShot( 0, guiApp->mainWindow(), [this, song, fullPath]()
+	{
+		song->loadProject( fullPath );
+		m_projectTransitionQueued = false;
+		emit logMessage( tr( "Deferred open project executed: %1" )
+			.arg( QFileInfo( fullPath ).fileName() ) );
+		processDeferredOpenProject();
+	} );
 }
 
 bool AgentControlService::saveProject( QString& result, QString& error )
@@ -2450,6 +3399,75 @@ bool AgentControlService::addSnarePattern( QString& error )
 	return true;
 }
 
+bool AgentControlService::addHiHatPattern( QString& error )
+{
+	const QString samplePath = defaultHiHatSample();
+	if( samplePath.isEmpty() )
+	{
+		error = tr( "Hi-hat sample missing" );
+		return false;
+	}
+
+	auto *track = createSampleTrack( tr( "Agent Hi-Hat" ) );
+	if( track == nullptr )
+	{
+		error = tr( "Failed to create sample track" );
+		return false;
+	}
+
+	const int stepTicks = DefaultTicksPerBar / DefaultStepsPerBar;
+	for( int step = 0; step < DefaultStepsPerBar; step += 2 )
+	{
+		addSampleClip( track, samplePath, step * stepTicks );
+	}
+	return true;
+}
+
+bool AgentControlService::addCrashPattern( QString& error )
+{
+	const QString samplePath = defaultCrashSample();
+	if( samplePath.isEmpty() )
+	{
+		error = tr( "Crash sample missing" );
+		return false;
+	}
+
+	auto *track = createSampleTrack( tr( "Agent Crash" ) );
+	if( track == nullptr )
+	{
+		error = tr( "Failed to create sample track" );
+		return false;
+	}
+
+	addSampleClip( track, samplePath, 0 );
+	return true;
+}
+
+bool AgentControlService::addRidePattern( QString& error )
+{
+	const QString samplePath = defaultRideSample();
+	if( samplePath.isEmpty() )
+	{
+		error = tr( "Ride sample missing" );
+		return false;
+	}
+
+	auto *track = createSampleTrack( tr( "Agent Ride" ) );
+	if( track == nullptr )
+	{
+		error = tr( "Failed to create sample track" );
+		return false;
+	}
+
+	const int stepTicks = DefaultTicksPerBar / DefaultStepsPerBar;
+	const int steps[] = { 0, 4, 8, 12 };
+	for( int s : steps )
+	{
+		addSampleClip( track, samplePath, s * stepTicks );
+	}
+	return true;
+}
+
 bool AgentControlService::addEffectToTrack( const QString& effectName, const QString& trackName, QString& result, QString& error )
 {
 	Track *track = trackName.isEmpty()
@@ -2467,20 +3485,8 @@ bool AgentControlService::addEffectToTrack( const QString& effectName, const QSt
 		return false;
 	}
 
-	QString resolvedEffect;
 	QString displayName = effectName.trimmed();
-	const QString requested = normalizeName( effectName );
-	for( const Plugin::Descriptor* desc : getPluginFactory()->descriptors( Plugin::Type::Effect ) )
-	{
-		const QString byName = normalizeName( QString::fromUtf8( desc->name ) );
-		const QString byDisplayName = normalizeName( QString::fromUtf8( desc->displayName ) );
-		if( requested == byName || requested == byDisplayName )
-		{
-			resolvedEffect = QString::fromUtf8( desc->name );
-			displayName = QString::fromUtf8( desc->displayName );
-			break;
-		}
-	}
+	const QString resolvedEffect = resolveEffectPlugin( effectName, displayName );
 	if( resolvedEffect.isEmpty() )
 	{
 		error = tr( "Unknown effect: %1" ).arg( effectName );
@@ -2537,11 +3543,16 @@ bool AgentControlService::removeEffectFromTrack( const QString& effectName, cons
 	}
 
 	const QString requested = normalizeName( effectName );
+	QString resolvedDisplay;
+	const QString resolvedEffect = normalizeName( resolveEffectPlugin( effectName, resolvedDisplay ) );
 	for( Effect *effect : chain->effects() )
 	{
 		const QString byName = normalizeName( QString::fromUtf8( effect->descriptor()->name ) );
 		const QString byDisplayName = normalizeName( effect->displayName() );
-		if( requested == byName || requested == byDisplayName )
+		const bool fuzzyRequested = requested.size() >= 4 &&
+			( byName.contains( requested ) || byDisplayName.contains( requested ) );
+		const bool canonicalResolved = !resolvedEffect.isEmpty() && byName == resolvedEffect;
+		if( requested == byName || requested == byDisplayName || fuzzyRequested || canonicalResolved )
 		{
 			const QString removedName = effect->displayName();
 			chain->removeEffect( effect );
@@ -3022,6 +4033,42 @@ QString AgentControlService::defaultSnareSample() const
 	return QFile::exists( fallback ) ? fallback : QString{};
 }
 
+QString AgentControlService::defaultHiHatSample() const
+{
+	const QString base = ConfigManager::inst()->factorySamplesDir();
+	const QString preferred = QDir( base ).filePath( "drums/hihat_closed01.ogg" );
+	if( QFile::exists( preferred ) )
+	{
+		return preferred;
+	}
+	const QString fallback = QDir( base ).filePath( "drums/hihat_closed03.ogg" );
+	return QFile::exists( fallback ) ? fallback : QString{};
+}
+
+QString AgentControlService::defaultCrashSample() const
+{
+	const QString base = ConfigManager::inst()->factorySamplesDir();
+	const QString preferred = QDir( base ).filePath( "drums/crash01.ogg" );
+	if( QFile::exists( preferred ) )
+	{
+		return preferred;
+	}
+	const QString fallback = QDir( base ).filePath( "drums/crash02.ogg" );
+	return QFile::exists( fallback ) ? fallback : QString{};
+}
+
+QString AgentControlService::defaultRideSample() const
+{
+	const QString base = ConfigManager::inst()->factorySamplesDir();
+	const QString preferred = QDir( base ).filePath( "drums/ride01.ogg" );
+	if( QFile::exists( preferred ) )
+	{
+		return preferred;
+	}
+	const QString fallback = QDir( base ).filePath( "drums/ride02.ogg" );
+	return QFile::exists( fallback ) ? fallback : QString{};
+}
+
 QString AgentControlService::canonicalPath( const QString& path ) const
 {
 	if( path.isEmpty() )
@@ -3422,6 +4469,24 @@ QString AgentControlService::resolveInstrumentPlugin( const QString& pluginName,
 QString AgentControlService::resolveEffectPlugin( const QString& effectName, QString& displayName ) const
 {
 	const QString wanted = normalizeName( effectName );
+	QString aliasWanted;
+	if( wanted == QStringLiteral( "reverb" ) )
+	{
+		aliasWanted = QStringLiteral( "reverbsc" );
+	}
+	else if( wanted == QStringLiteral( "equalizer" ) || wanted == QStringLiteral( "eq" ) )
+	{
+		aliasWanted = QStringLiteral( "eq" );
+	}
+	else if( wanted == QStringLiteral( "comp" ) || wanted == QStringLiteral( "compressor" ) )
+	{
+		aliasWanted = QStringLiteral( "compressor" );
+	}
+	else if( wanted == QStringLiteral( "distortion" ) )
+	{
+		aliasWanted = QStringLiteral( "slewdistortion" );
+	}
+
 	QString fuzzyMatch;
 	QString fuzzyDisplay;
 
@@ -3429,12 +4494,14 @@ QString AgentControlService::resolveEffectPlugin( const QString& effectName, QSt
 	{
 		const QString byName = normalizeName( QString::fromUtf8( desc->name ) );
 		const QString byDisplay = normalizeName( QString::fromUtf8( desc->displayName ) );
-		if( byName == wanted || byDisplay == wanted )
+		if( byName == wanted || byDisplay == wanted || ( !aliasWanted.isEmpty() && byName == aliasWanted ) )
 		{
 			displayName = QString::fromUtf8( desc->displayName );
 			return QString::fromUtf8( desc->name );
 		}
-		if( fuzzyMatch.isEmpty() && ( byName.contains( wanted ) || byDisplay.contains( wanted ) ) )
+		if( fuzzyMatch.isEmpty() &&
+			( byName.contains( wanted ) || byDisplay.contains( wanted ) ||
+			  ( !aliasWanted.isEmpty() && ( byName.contains( aliasWanted ) || byDisplay.contains( aliasWanted ) ) ) ) )
 		{
 			fuzzyMatch = QString::fromUtf8( desc->name );
 			fuzzyDisplay = QString::fromUtf8( desc->displayName );
