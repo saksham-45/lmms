@@ -45,7 +45,23 @@
 - `rollback_to_snapshot`
 - `diff_since_snapshot`
 
-## 2) Discovery Layer (`lmmsagent/shared/discovery.py`)
+## 2) Runtime Split (Phase 1)
+
+`lmmsagent/lmms-agentd/main.py` is a persistent daemon that owns:
+
+- discovery refresh/index cache
+- planner/orchestrator lifecycle
+- retry policy by timeout class
+- idempotency cache for duplicate request suppression
+
+Protocol envelope (newline-delimited JSON over localhost, default `127.0.0.1:7781`):
+
+- request: `op`, `request_id`, `idempotency_key`, `timeout_class`, `retries`, payload fields
+- response: `ok`, `request_id`, `op`, `attempts`, `duration_ms`, `result|error`
+
+LMMS plugin stays the executor behind `ToolClient` on `127.0.0.1:7777`.
+
+## 3) Discovery Layer (`lmmsagent/shared/discovery.py`)
 
 Deterministic resolution pipeline:
 
@@ -61,7 +77,7 @@ Indexed asset sources:
 - project-local audio
 - Downloads and configured sample roots
 
-## 3) Planner + Orchestrator
+## 4) Planner + Orchestrator
 
 - Planner (`planner.py`) emits JSON-only `plan` / `clarify` / `reject`.
 - Orchestrator (`orchestrator.py`) executes step-by-step with verify loop:
@@ -78,7 +94,23 @@ Clarification policy:
 - risky/destructive steps
 - subjective prompts (e.g. texture/vibe/harder)
 
-## 4) Project Memory (`memory.py`)
+## 5) Phase 0 Observability Baseline
+
+Orchestrator returns per-request telemetry:
+
+- `request_id`
+- `total_runtime_ms`
+- `stage_timings_ms` (`discovery_refresh`, `planning`, `step_execution`, etc.)
+- structured `trace_events` (`start/end/error` by stage)
+
+`ToolClient` also attaches transport timing to each tool response as `_transport.latency_ms`.
+
+Baseline benchmark script:
+
+- `lmmsagent/scripts/benchmark_phase01.py`
+- computes success/clarification rates and p50/p95 latency from reproducible command buckets.
+
+## 6) Project Memory (`memory.py`)
 
 Project-scoped data under `~/.lmmsagent/memory/<project_hash>/`:
 

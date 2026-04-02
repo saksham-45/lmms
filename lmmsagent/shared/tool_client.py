@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 
 class ToolClientError(RuntimeError):
@@ -16,8 +17,9 @@ class ToolClient:
     port: int = 7777
     timeout_s: float = 5.0
 
-    def _exchange(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _exchange(self, payload: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
         raw = (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
+        started = time.monotonic()
         try:
             with socket.create_connection((self.host, self.port), timeout=self.timeout_s) as conn:
                 conn.sendall(raw)
@@ -41,10 +43,16 @@ class ToolClient:
             raise ToolClientError(f"Invalid JSON response: {line!r}") from exc
         if not isinstance(response, dict):
             raise ToolClientError("Tool server returned a non-object response")
-        return response
+        latency_ms = int((time.monotonic() - started) * 1000)
+        return response, latency_ms
 
     def call_tool(self, tool: str, args: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        response = self._exchange({"tool": tool, "args": args or {}})
+        response, latency_ms = self._exchange({"tool": tool, "args": args or {}})
+        response["_transport"] = {
+            "host": self.host,
+            "port": self.port,
+            "latency_ms": latency_ms,
+        }
         if not response.get("ok", False):
             code = response.get("error_code") or "tool_failed"
             message = response.get("error_message") or "unknown tool failure"
